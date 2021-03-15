@@ -22,20 +22,26 @@ import System.IO.Unsafe (unsafePerformIO)
 --getTime :: IO CTime
 --getTime = c_time nullPtr
 
-
+make :: [[Float]] -> Tree Buffer
+make a = Parameter $ create (length a, length (head a)) (concat a)
 
 f = do
   initialise
-  --let a = {# call pure XLA_CreateBuffer as ^ #} 1 7 3 4
-  --let b = {# call pure XLA_CreateBuffer as ^ #} 1 1 1 3
-  let a = Parameter (create (2, 2) [1, 1, 1, 1])
-  --let c = create (2, 2) [1, 1, 1, 1]
-  --run (BinEval Add (BinEval Add (Parameter b) (Parameter a)) (Parameter a))
-  let b = 2 * a
-  let c = $$(power @(Tree Buffer) 4) b
+  let a = make [ [1, 1]
+               , [2, 1] ]
+  let b = make [ [2, 2]
+               , [3, 2] ]
+  --let c = $$(mul [[||2||], [||2||], [||2||]]) a
+  let c = Parameter (run (MatMul a b))
   return (c, c)
-  --let b = create (2, 2) [1, 1, 1, 3]
-  --run (BinEval Add (UnaryEval Negate (Parameter a)) (Parameter b))
+  
+--let b = create (2, 2) [1, 1, 1, 3]
+--run (BinEval Add (UnaryEval Negate (Parameter a)) (Parameter b))
+--let c = create (2, 2) [1, 1, 1, 1]
+--run (BinEval Add (BinEval Add (Parameter b) (Parameter a)) (Parameter a))
+--let b = 2 * a
+--let a = {# call pure XLA_CreateBuffer as ^ #} 1 7 3 4
+--let b = {# call pure XLA_CreateBuffer as ^ #} 1 1 1 3
 
 main = do
   --let hlo = evalTop (BinEval Add (BinEval Power (Broadcast 2) (Parameter 0)) (Parameter 1))
