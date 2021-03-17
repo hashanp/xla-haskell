@@ -14,6 +14,7 @@ import Foreign.Marshal.Alloc
 import System.IO.Unsafe (unsafePerformIO)
 import Data.List (intercalate)
 import Control.Monad.State.Lazy
+import Control.Monad (when)
 
 #include "tensorflow/compiler/xla/hashan/c_api.h"
 
@@ -34,6 +35,8 @@ data BinOp
   | Maximum
   | Minimum
   | Power
+  | Dot
+  | ReduceAdd
   deriving (Eq, Lift)
 
 data UnaryOp
@@ -61,7 +64,6 @@ data Tree a
   = Constant Float
   | Parameter a
   | BinEval BinOp (Tree a) (Tree a)
-  | MatMul (Tree a) (Tree a)
   | UnaryEval UnaryOp (Tree a)
   deriving (Lift)
 
@@ -92,10 +94,6 @@ change (BinEval binOp treeA treeB) = do
 change (UnaryEval unOp tree) = do 
   (tree', result) <- change tree
   return (UnaryEval unOp tree', result)
-change (MatMul treeA treeB) = do
-  (treeA', result) <- change treeA
-  (treeB', result') <- change treeB
-  return (MatMul treeA' treeB', result ++ result')
 change (Constant f) = do
   return (Constant f, [])
 
@@ -114,7 +112,13 @@ run = unsafePerformIO . run'
 evalTop :: TreeRaw -> (String, Size)
 evalTop tree = (unlines $ [
   "HloModule xla_comp.0", 
-  "", 
+  "",
+  "primitive_computation_add.0 {",
+  "  parameter.1 = f32[] parameter(0)",
+  "  parameter.2 = f32[] parameter(1)",
+  "  ROOT add.3 = f32[] add(parameter.1, parameter.2)",
+  "}",
+  "",
   "ENTRY xla_comp.0 {"] ++
   init result ++
   ["  ROOT" ++ tail (last result), -- "  ROOT tuple." ++ (show st) ++ " = (f32[2,2]{1,0}) " ++ loc ++ "",
@@ -160,13 +164,29 @@ complete size opStr prev args params = do
   let cmd = "  " ++ loc ++ " = " ++ showSize size ++ " " ++ opStr ++ argStr ++ paramStr
   return (prev ++ [cmd], loc, size)
 
+
+norm (Dim2R m1 m2) = Dim2 m1 m2
+norm x = x
+
+compat' Dim0 Dim0 = True
+compat' (Dim1 m) (Dim1 n) = m == n
+compat' (Dim2 m1 m2) (Dim2 n1 n2) = m1 == m2 && n1 == n2
+
+compat m n = compat' (norm m) (norm n)
+
 eval :: TreeRaw -> State Int ([String], String, Size)
 eval (Parameter (i, size)) = 
   complete size "parameter" [] [show i] []
 
 eval (UnaryEval (Broadcast size) tree) = do
-  (result, loc, _) <- eval tree
-  complete size "broadcast" result [loc] [("dimensions", "{}")]
+  (result, loc, size') <- eval tree
+  let args = compat size' size
+  complete size "broadcast" result [loc] args
+  where compat Dim0 (Dim2R _ _) = error "Size Mismatch"
+        compat Dim0 _ = [("dimensions", "{}")]
+        compat (Dim1 m) (Dim2 n1 n2)
+          | m == n2 = [("dimensions", "{1}")]
+        compat _ _ = error "Size Mismatch"
 
 eval (UnaryEval Transpose tree) = do
   (result, loc, size) <- eval tree
@@ -183,20 +203,41 @@ eval (UnaryEval op tree) = do
                 _ -> size
   complete size' opStr result [loc] []
 
+eval (BinEval Dot treeA treeB) = do
+  (result, loc, size) <- eval treeA
+  (result', loc', size') <- eval treeB
+  let outputSize = compat size size'
+  let args = case outputSize of
+               Dim0 -> [("lhs_contracting_dims", "{0}"), ("rhs_contracting_dims", "{0}")]
+               Dim2 _ _ -> [("lhs_contracting_dims", "{1}"), ("rhs_contracting_dims", "{0}")]
+  complete outputSize "dot" (result ++ result') [loc, loc'] args
+  where compat m n = compat' (norm m) (norm n)
+        compat' (Dim2 m1 m2) (Dim2 n1 n2)
+          | m2 == n1 = Dim2 m1 n2
+        compat' (Dim1 m) (Dim1 n)
+          | m == n = Dim0
+        compat' _ _ = error "Size Mismatch"
+
+eval (BinEval ReduceAdd treeA treeB) = do
+  (result, loc, size) <- eval treeA
+  (result', loc', size') <- eval treeB
+  when (size' /= Dim0) (error "Size Mismatch")
+  let outputSize = case norm size of
+                     Dim1 m -> Dim0
+                     Dim2 m n -> Dim1 m
+                     _ -> error "Size Mismatch"
+  let dims = case outputSize of
+               Dim1 _ -> "{1}"
+               Dim0 -> "{0}"
+  complete outputSize "reduce" (result ++ result') [loc, loc'] [("dimensions", dims), ("to_apply", "primitive_computation_add.0")]
+
 eval (BinEval op treeA treeB) = do
   (result, loc, size) <- eval treeA
   (result', loc', size') <- eval treeB
   let opStr = fromJust $ lookup op binary
-  if size /= size'
-    then error "Size Mismatch"
-    else complete size opStr (result ++ result') [loc, loc'] []
-
-eval (MatMul treeA treeB) = do
-  (result, loc, size) <- eval treeA
-  (result', loc', size') <- eval treeB
-  if size /= size'
-    then error "Size Mismatch"
-    else complete size "dot" (result ++ result') [loc, loc'] [("lhs_contracting_dims", "{1}"), ("rhs_contracting_dims", "{0}")]
+  if size `compat` size'
+    then complete size opStr (result ++ result') [loc, loc'] []
+    else error "Size Mismatch"
 
 eval (Constant f) = do
   complete Dim0 "constant" [] [show f] []

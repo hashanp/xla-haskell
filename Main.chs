@@ -30,10 +30,11 @@ make' = Parameter . create1D
 
 f = do
   initialise
-  let a = make' [1, 2, 3, 4]
-  let b = Parameter (run (unaryEval (Broadcast (Dim2 4 4)) a))
+  let a = make [[1, 2], [3, 4]]
+  let b = make' [1, 2, 3, 4]
+  let c = Parameter (run (binEval ReduceAdd a 0))
   --let c = a + b
-  return (b, b)
+  return (c, c)
   {-let a = make [ [1, 1]
                , [2, 1] ]
   let b = make [ [2, 2]
