@@ -23,17 +23,24 @@ import System.IO.Unsafe (unsafePerformIO)
 --getTime = c_time nullPtr
 
 make :: [[Float]] -> Tree Buffer
-make a = Parameter $ create (length a, length (head a)) (concat a)
+make a = Parameter $ create2D (length a, length (head a)) (concat a)
+
+make' :: [Float] -> Tree Buffer
+make' = Parameter . create1D
 
 f = do
   initialise
-  let a = make [ [1, 1]
+  let a = make' [1, 2, 3, 4]
+  let b = Parameter (run (unaryEval (Broadcast (Dim2 4 4)) a))
+  --let c = a + b
+  return (b, b)
+  {-let a = make [ [1, 1]
                , [2, 1] ]
   let b = make [ [2, 2]
                , [3, 2] ]
   --let c = $$(mul [[||2||], [||2||], [||2||]]) a
   let c = Parameter (run (MatMul a b))
-  return (c, c)
+  return (c, c)-}
   
 --let b = create (2, 2) [1, 1, 1, 3]
 --run (BinEval Add (UnaryEval Negate (Parameter a)) (Parameter b))
