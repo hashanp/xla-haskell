@@ -79,6 +79,8 @@ instance Num (Tree Buffer) where
   {-# INLINE negate #-}
   {-# INLINE (+) #-}
 
+a @@ b = Parameter (run (binEval Dot a b))
+
 instance Fractional (Tree Buffer) where
   a / b = Parameter (run (binEval Divide a b))
   fromRational a = undefined
@@ -89,6 +91,7 @@ instance Floating (Tree Buffer) where
   log a = Parameter (run (unaryEval Log a))
   sin a = Parameter (run (unaryEval Sine a))
   cos a = Parameter (run (unaryEval Cosine a))
+  tanh a = Parameter (run (unaryEval Tanh a))
   sinh = undefined
   cosh = undefined
   asinh = undefined
