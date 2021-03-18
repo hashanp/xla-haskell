@@ -23,7 +23,10 @@ executable haskell
   build-depends:       base >=4.14 && <4.15,
                        array,
                        template-haskell,
-                       mtl
+                       mtl,
+                       vector,
+                       mnist-idx,
+                       random
   -- hs-source-dirs:
   default-language:    Haskell2010
   extra-lib-dirs: ../tensorflow/bazel-bin/tensorflow/

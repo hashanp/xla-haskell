@@ -3,7 +3,7 @@ module Lib where
 
 import Language.Haskell.TH.Lib
 import Language.Haskell.TH.Syntax
-import Prelude hiding (sin)
+import Prelude
 import Foreign.C.String
 import Foreign.C
 import Foreign.Ptr (Ptr, nullPtr)
@@ -79,6 +79,22 @@ instance Num (Tree Buffer) where
   {-# INLINE negate #-}
   {-# INLINE (+) #-}
 
+instance Fractional (Tree Buffer) where
+  a / b = Parameter (run (binEval Divide a b))
+  fromRational a = undefined
+
+instance Floating (Tree Buffer) where
+  pi = undefined
+  exp a = Parameter (run (unaryEval Exponential a))
+  log a = Parameter (run (unaryEval Log a))
+  sin a = Parameter (run (unaryEval Sine a))
+  cos a = Parameter (run (unaryEval Cosine a))
+  sinh = undefined
+  cosh = undefined
+  asinh = undefined
+  acosh = undefined
+  atanh = undefined
+
 getSize :: Buffer -> Size
 getSize (a, b) = b
 
@@ -147,6 +163,17 @@ binary =
     (Minimum, "minimum"),
     (Power, "power")
   ]
+
+len :: Tree Buffer -> Int
+len (Parameter (_, Dim1 m)) = m
+
+rows :: Tree Buffer -> Int
+rows (Parameter (_, Dim2 m _)) = m
+rows (Parameter (_, Dim2R m _)) = m
+
+cols :: Tree Buffer -> Int
+cols (Parameter (_, Dim2 _ n)) = n
+cols (Parameter (_, Dim2R _ n)) = n
 
 showSize :: Size -> String
 showSize (Dim2R a b) = "f32[" ++ show a ++ "," ++ show b ++ "]{0,1}"
@@ -244,6 +271,7 @@ eval (Constant f) = do
 
 create2D :: Size2D -> [Float] -> Buffer
 create2D (m, n) list = unsafePerformIO do
+  when (m * n /= length list) (error "Size Mismatch")
   arr <- newArray (map CFloat list)
   t <- {# call unsafe XLA_CreateBuffer2D as ^ #} arr (fromIntegral m) (fromIntegral n)
   free arr
