@@ -38,6 +38,7 @@ data BinOp
   | Dot
   | ReduceAdd
   | Gather
+  | Compare CompOp
   deriving (Eq, Lift)
 
 data UnaryOp
@@ -50,6 +51,7 @@ data UnaryOp
   | Sign
   | Log
   | Transpose
+  | ReduceArgMax
   | Reshape Size
   | Broadcast Size
   deriving (Eq, Lift)
@@ -60,6 +62,8 @@ data CompOp
   | LE
   | GE
   | EQ
+  | NE
+  deriving (Show, Lift, Eq)
 
 data Tree a
   = Constant Float
@@ -79,6 +83,8 @@ instance Num Buffer where
   {-# INLINE (*) #-}
   {-# INLINE negate #-}
   {-# INLINE (+) #-}
+
+a `eq` b = run (binEval (Compare Lib.EQ) (Parameter a) (Parameter b))
 
 a @@ b = run (binEval Dot (Parameter a) (Parameter b))
 gather a b = run (binEval Gather (Parameter a) (Parameter b))
@@ -142,6 +148,17 @@ evalTop tree = (unlines $ [
   "  ROOT add.3 = f32[] add(parameter.1, parameter.2)",
   "}",
   "",
+  "primitive_computation_argmax.0 {",
+  "  parameter.1 = f32[] parameter(0)",
+  "  parameter.2 = f32[] parameter(1)",
+  "  parameter.3 = f32[] parameter(2)",
+  "  parameter.4 = f32[] parameter(3)",
+  "  compare.5 = pred[] compare(parameter.1, parameter.3), direction=GT",
+  "  select.6 = f32[] select(compare.5, parameter.1, parameter.3)",
+  "  select.7 = f32[] select(compare.5, parameter.2, parameter.4) ",
+  "  ROOT tuple.8 = (f32[], f32[]) tuple(select.6, select.7)",
+  "}",
+  "",
   "ENTRY xla_comp.0 {"] ++
   init result ++
   ["  ROOT" ++ tail (last result), -- "  ROOT tuple." ++ (show st) ++ " = (f32[2,2]{1,0}) " ++ loc ++ "",
@@ -183,10 +200,13 @@ cols (Device _ (Dim2 _ n)) = n
 cols (Device _ (Dim2R _ n)) = n
 
 showSize :: Size -> String
-showSize (Dim2R a b) = "f32[" ++ show a ++ "," ++ show b ++ "]{0,1}"
-showSize (Dim2 a b) = "f32[" ++ show a ++ "," ++ show b ++ "]{1,0}"
-showSize (Dim1 a) = "f32[" ++ show a ++ "]{0}"
-showSize Dim0 = "f32[]"
+showSize = showSize' "f32"
+
+showSize' :: String -> Size -> String
+showSize' op (Dim2R a b) = op ++ "[" ++ show a ++ "," ++ show b ++ "]{0,1}"
+showSize' op (Dim2 a b) = op ++ "[" ++ show a ++ "," ++ show b ++ "]{1,0}"
+showSize' op (Dim1 a) = op ++ "[" ++ show a ++ "]{0}"
+showSize' op Dim0 = op ++ "[]"
 
 complete :: Size -> String -> [String] -> [String] -> [(String, String)] -> State Int ([String], String, Size)
 complete size opStr prev args params = do
@@ -229,6 +249,19 @@ eval (UnaryEval Transpose tree) = do
                 Dim2R a b -> Dim2 b a
   complete size' "transpose" result [loc] [("dimensions", "{1,0}")]
 
+eval (UnaryEval ReduceArgMax tree) = do
+  (result, loc, size) <- eval tree
+  let Dim2 rows cols = norm size
+  st <- get
+  let op1 = "  constant." ++ show st ++ " = f32[] constant(-inf)"
+  let op2 = "  constant." ++ show (st + 1) ++ " = f32[] constant(0)"
+  let op3 = "  iota." ++ show (st + 2) ++ " = f32[" ++ show rows ++ "," ++ show cols ++ "] iota(), iota_dimension=1"
+  let op4 = "  reduce." ++ show (st + 3) ++ " = (f32[" ++ show rows ++ "]{0}, f32[" ++ show rows ++ "]{0}) reduce(" 
+              ++ loc ++ ", iota." ++ show (st + 2) ++ ", constant." ++ show st ++ ", " ++ "constant." 
+              ++ show (st + 1) ++ "), dimensions={1}, to_apply=primitive_computation_argmax.0"
+  put (st + 4)
+  complete (Dim1 rows) "get-tuple-element" (result ++ [op1, op2, op3, op4]) ["reduce." ++ show (st + 3)] [("index", "1")]
+
 eval (UnaryEval op tree) = do
   (result, loc, size) <- eval tree
   let opStr = unary op
@@ -236,6 +269,17 @@ eval (UnaryEval op tree) = do
                 Reshape s -> s
                 _ -> size
   complete size' opStr result [loc] []
+
+eval (BinEval (Compare op) treeA treeB) = do
+  (result, loc, size) <- eval treeA
+  (result', loc', size') <- eval treeB
+  if size `compat` size'
+    then do
+      st <- get
+      let compare = "  compare." ++ show st ++ " = " ++ showSize' "pred" size ++ " compare(" ++ loc ++ ", " ++ loc' ++ "), direction=" ++ show op 
+      put (st + 1)
+      complete size "convert" (result ++ result' ++ [compare]) ["compare." ++ show st] []
+    else error "Size Mismatch"
 
 eval (BinEval Dot treeA treeB) = do
   (result, loc, size) <- eval treeA

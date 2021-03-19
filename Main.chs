@@ -36,8 +36,8 @@ make a = create2D (length a, length (head a)) (concat a)
 make' :: [Float] -> Buffer
 make' =  create1D
 
-c = undefined
-c' = undefined
+c = Const . fromIntegral
+c' = Const
 broadcast s =  run . unaryEval (Broadcast (Dim1 s)) . Parameter
 
 sum x = run (binEval ReduceAdd (Parameter x) (Parameter 0))
@@ -167,10 +167,10 @@ main = do
   let x = create2D (60000, 28 * 28) (map fromIntegral (V.toList (idxIntContent images)))
   print $ getSize x
   print $ getSize y-}
-  let a = make' [1,2,3,4,5,6]
-  let b = a + broadcast 6 1
+  let a = make [[1,2,3],[3,4,2],[6,4,3]]
+  let b = run (unaryEval ReduceArgMax (Parameter a)) --make' [2,2,3,4,5,7]
+  --let c = a `eq` b
   printView b
-
   batch <- chunksOf batchSize <$> shuffle [0..59999]
   print $ head batch
   
