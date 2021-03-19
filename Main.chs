@@ -30,17 +30,17 @@ import GHC.Arr
 --getTime :: IO CTime
 --getTime = c_time nullPtr
 
-make :: [[Float]] -> Tree Buffer
-make a = Parameter $ create2D (length a, length (head a)) (concat a)
+make :: [[Float]] -> Buffer
+make a = create2D (length a, length (head a)) (concat a)
 
-make' :: [Float] -> Tree Buffer
-make' = Parameter . create1D
+make' :: [Float] -> Buffer
+make' =  create1D
 
-c = Constant . fromIntegral
-c' = Constant
-broadcast s = Parameter . run . unaryEval (Broadcast (Dim1 s))
+c = undefined
+c' = undefined
+broadcast s =  run . unaryEval (Broadcast (Dim1 s)) . Parameter
 
-sum x = Parameter (run (binEval ReduceAdd x 0))
+sum x = run (binEval ReduceAdd (Parameter x) (Parameter 0))
 mean x = sum x / c (len x)
 softmax x = exp x / (broadcast (len x) (sum (exp x)))
 square x = x * x
@@ -86,7 +86,7 @@ shuffle xs = do
           writeSTArray ar j vi
           writeSTArray ar i vj
         return ar
-  return xs
+  return (elems ar)
 
 makeR (m, n) = do
   let len = m * n
@@ -98,10 +98,10 @@ makeR' m = do
   return (create1D (take m values))
 
 type Code a = TExpQ a
-type Tensor = Tree Buffer
+type Tensor = Buffer
 type Layer = (Code ((Tensor, Tensor, Tensor) -> Tensor), Code ((Tensor, Tensor, Tensor) -> Tensor -> Tensor -> (Tensor, Tensor, Tensor)))
 
-transpose a = Parameter (run (unaryEval Transpose a))
+transpose a = run (unaryEval Transpose (Parameter a))
 
 linearTanh :: Layer
 linearTanh = (
@@ -151,17 +151,34 @@ compute layers
 update :: Float -> (Tensor, Tensor) -> (Tensor, Tensor) -> (Tensor, Tensor)
 update stepSize (w, b) (deltaW, deltaB) = (w - c' stepSize * deltaW, b - c' stepSize * deltaB)
 
+testDataSrc = "../data/t10k-images-idx3-ubyte"
+testLabelsSrc = "../data/t10k-labels-idx1-ubyte"
+trainDataSrc = "../data/train-images-idx3-ubyte"
+trainLabelsSrc = "../data/train-labels-idx1-ubyte"
+batchSize = 128
+
 main = do
   initialise
-  Just images <- decodeIDXFile "../data/t10k-images-idx3-ubyte"
-  Just (IDXLabels labels) <- decodeIDXLabelsFile "../data/t10k-labels-idx1-ubyte"
+  Just images <- decodeIDXFile trainDataSrc
+  Just (IDXLabels labels) <- decodeIDXLabelsFile trainLabelsSrc
   print $ idxDimensions images
-  printView =<< (makeR' 4)
-  let y = create2D (10000, 10) (concatMap oneHotEncode (V.toList labels))
-  let x = create2D (10000, 28 * 28) (map fromIntegral (V.toList (idxIntContent images)))
+  --printView =<< (makeR' 4)
+  {-let y = create2D (60000, 10) (concatMap oneHotEncode (V.toList labels))
+  let x = create2D (60000, 28 * 28) (map fromIntegral (V.toList (idxIntContent images)))
   print $ getSize x
-  print $ getSize y
+  print $ getSize y-}
+  let a = make' [1,2,3,4,5,6]
+  let b = a + broadcast 6 1
+  printView b
+
+  batch <- chunksOf batchSize <$> shuffle [0..59999]
+  print $ head batch
   
+{-let a = make [[1,2],[3,4],[5,6]]
+  let b = make' [1, 0]
+  let (Parameter c) = gather a (reshape b (Dim2 2 1))
+  printView c-}
+
 {- (Parameter x, Parameter y) <- f
   print (x, y)
   printView x

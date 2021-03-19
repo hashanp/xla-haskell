@@ -24,7 +24,7 @@ import Control.Monad (when)
 type Size2D = (Int, Int)
 data Size = Dim2R Int Int | Dim2 Int Int | Dim1 Int | Dim0
   deriving (Eq, Show, Lift)
-type Buffer = (Ptr BufferPrim, Size)
+data Buffer = Device (Ptr BufferPrim) Size | Const Float
 type TreeRaw = Tree (Int, Size)
 
 data BinOp
@@ -37,6 +37,7 @@ data BinOp
   | Power
   | Dot
   | ReduceAdd
+  | Gather
   deriving (Eq, Lift)
 
 data UnaryOp
@@ -67,31 +68,33 @@ data Tree a
   | UnaryEval UnaryOp (Tree a)
   deriving (Lift)
 
-instance Num (Tree Buffer) where
-  a + b = Parameter (run (binEval Add a b))
-  a - b = Parameter (run (binEval Subtract a b))
-  a * b = Parameter (run (binEval Multiply a b))
-  negate a = Parameter (run (unaryEval Negate a))
-  abs a = Parameter (run (unaryEval Abs a))
-  signum a = Parameter (run (unaryEval Sign a))                           
-  fromInteger a = Constant (fromIntegral a)
+instance Num Buffer where
+  a + b = run (binEval Add (Parameter a) (Parameter b))
+  a - b = run (binEval Subtract (Parameter a) (Parameter b))
+  a * b = run (binEval Multiply (Parameter a) (Parameter b))
+  negate a = run (unaryEval Negate (Parameter a))
+  abs a = run (unaryEval Abs (Parameter a))
+  signum a = run (unaryEval Sign (Parameter a))                           
+  fromInteger = Const . fromIntegral -- Constant (fromIntegral a)
   {-# INLINE (*) #-}
   {-# INLINE negate #-}
   {-# INLINE (+) #-}
 
-a @@ b = Parameter (run (binEval Dot a b))
+a @@ b = run (binEval Dot (Parameter a) (Parameter b))
+gather a b = run (binEval Gather (Parameter a) (Parameter b))
+reshape a s = run (unaryEval (Reshape s) (Parameter a))
 
-instance Fractional (Tree Buffer) where
-  a / b = Parameter (run (binEval Divide a b))
+instance Fractional Buffer where
+  a / b = run (binEval Divide (Parameter a) (Parameter b))
   fromRational a = undefined
 
-instance Floating (Tree Buffer) where
+instance Floating Buffer where
   pi = undefined
-  exp a = Parameter (run (unaryEval Exponential a))
-  log a = Parameter (run (unaryEval Log a))
-  sin a = Parameter (run (unaryEval Sine a))
-  cos a = Parameter (run (unaryEval Cosine a))
-  tanh a = Parameter (run (unaryEval Tanh a))
+  exp a = run (unaryEval Exponential (Parameter a))
+  log a = run (unaryEval Log (Parameter a))
+  sin a = run (unaryEval Sine (Parameter a))
+  cos a = run (unaryEval Cosine (Parameter a))
+  tanh a = run (unaryEval Tanh (Parameter a))
   sinh = undefined
   cosh = undefined
   asinh = undefined
@@ -99,13 +102,14 @@ instance Floating (Tree Buffer) where
   atanh = undefined
 
 getSize :: Buffer -> Size
-getSize (a, b) = b
+getSize (Device a b) = b
 
 change :: Tree Buffer -> State Int (TreeRaw, [Buffer])
-change (Parameter a) = do
+change (Parameter (Const f)) = return (Constant f, [])
+change (Parameter a@(Device _ size)) = do
   st <- get
   put (st + 1)
-  return (Parameter (st, getSize a), [a])
+  return (Parameter (st, size), [a])
 change (BinEval binOp treeA treeB) = do
   (treeA', result) <- change treeA
   (treeB', result') <- change treeB
@@ -122,9 +126,9 @@ run' tree = do
   let (code, size) = evalTop tree'
   putStrLn code
   code' <- newCString code
-  arr <- newArray (map fst xs)
+  arr <- newArray (map (\(Device x _) -> x) xs)
   putStrLn $ "len " ++ show (length xs)
-  return $ ({# call pure XLA_Create as ^ #} code' (fromIntegral (length xs)) arr, size)
+  return $ Device ({# call pure XLA_Create as ^ #} code' (fromIntegral (length xs)) arr) size
 
 run = unsafePerformIO . run'
 
@@ -167,16 +171,16 @@ binary =
     (Power, "power")
   ]
 
-len :: Tree Buffer -> Int
-len (Parameter (_, Dim1 m)) = m
+len :: Buffer -> Int
+len (Device _ (Dim1 m)) = m
 
-rows :: Tree Buffer -> Int
-rows (Parameter (_, Dim2 m _)) = m
-rows (Parameter (_, Dim2R m _)) = m
+rows :: Buffer -> Int
+rows (Device _ (Dim2 m _)) = m
+rows (Device _ (Dim2R m _)) = m
 
-cols :: Tree Buffer -> Int
-cols (Parameter (_, Dim2 _ n)) = n
-cols (Parameter (_, Dim2R _ n)) = n
+cols :: Buffer -> Int
+cols (Device _ (Dim2 _ n)) = n
+cols (Device _ (Dim2R _ n)) = n
 
 showSize :: Size -> String
 showSize (Dim2R a b) = "f32[" ++ show a ++ "," ++ show b ++ "]{0,1}"
@@ -248,6 +252,22 @@ eval (BinEval Dot treeA treeB) = do
           | m == n = Dim0
         compat' _ _ = error "Size Mismatch"
 
+eval (BinEval Gather treeA treeB) = do
+  (result, loc, size) <- eval treeA
+  (result', loc', size') <- eval treeB
+  let outputRows = case size' of
+            Dim2 m 1 -> m
+            _ -> error "Size Mismatch"
+  let outputCols = case size of
+            Dim2 m n -> n
+            _ -> error "Size Mismatch"
+  st <- get
+  let convert = "  convert." ++ show st ++ " = s32[" ++ show outputRows ++ ",1]{1,0} convert(" ++ loc' ++ ")" 
+  put (st + 1)
+  complete (Dim2 outputRows outputCols) "gather" (result ++ result' ++ [convert]) [loc, "convert." ++ show st] 
+    [("offset_dims", "{1}"), ("collapsed_slice_dims", "{0}"), ("start_index_map","{0}"),
+      ("index_vector_dim", "1"), ("slice_sizes", "{1," ++ show outputCols ++ "}")]
+
 eval (BinEval ReduceAdd treeA treeB) = do
   (result, loc, size) <- eval treeA
   (result', loc', size') <- eval treeB
@@ -278,7 +298,7 @@ create2D (m, n) list = unsafePerformIO do
   arr <- newArray (map CFloat list)
   t <- {# call unsafe XLA_CreateBuffer2D as ^ #} arr (fromIntegral m) (fromIntegral n)
   free arr
-  return (t, Dim2 m n)
+  return $ Device t (Dim2 m n)
 
 create1D :: [Float] -> Buffer
 create1D list = unsafePerformIO do
@@ -286,7 +306,7 @@ create1D list = unsafePerformIO do
   let len = length list
   t <- {# call unsafe XLA_CreateBuffer1D as ^ #} arr (fromIntegral len)
   free arr
-  return (t, Dim1 len)
+  return $ Device t (Dim1 len)
 
 {-let arr = listArray ((0, 0), (m, n)) list in
 let (_, ptr) = toForeignPtr arr in
@@ -310,9 +330,9 @@ power ::  (Num a) => Int -> TExpQ (a -> a)
 power 0 = [|| const 1 ||]
 power n = [|| \a -> a * $$(power (n - 1)) a ||]
 
-mul :: [TExpQ (Tree Buffer)] -> TExpQ (Tree Buffer -> Tree Buffer)
+mul :: [TExpQ Buffer] -> TExpQ (Buffer -> Buffer)
 mul [] = [|| \a -> a ||]
 mul (x:xs) = [|| \a -> $$x * $$(mul xs) a ||]
 
-printView = {# call unsafe XLA_Print as ^ #} . fst
+printView (Device a _) = {# call unsafe XLA_Print as ^ #} a
 initialise = {# call unsafe XLA_Init as ^ #}
