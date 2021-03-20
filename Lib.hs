@@ -6,26 +6,36 @@ import Language.Haskell.TH.Syntax
 import Prelude hiding (sum)
 import Foreign.C.String
 import Foreign.C
-import Foreign.Ptr (Ptr, nullPtr)
+import Foreign.Ptr (Ptr, FunPtr, nullPtr)
 import Data.Maybe (fromJust)
 import System.Mem
 import Foreign.Marshal.Array
 import Foreign.Marshal.Alloc
+import Foreign.ForeignPtr
 import System.IO.Unsafe (unsafePerformIO)
+import Foreign.ForeignPtr.Unsafe
 import Data.List (intercalate)
 import Control.Monad.State.Lazy
 import Control.Monad (when)
 
-#include "tensorflow/compiler/xla/hashan/c_api.h"
+-- #include "tensorflow/compiler/xla/hashan/c_api.h"
 
 --finalizer XLA_Remove as ^
-{#pointer *Buffer as BufferPrim foreign newtype#}
+--{#pointer *Buffer as BufferPrim foreign finalizer XLA_Remove as ^ newtype#}
+
+data BufferPrim
+foreign import ccall "XLA_CreateBuffer1D" xlaCreateBuffer :: Ptr CFloat -> CInt -> IO (Ptr BufferPrim)
+foreign import ccall "XLA_CreateBuffer2D" xlaCreateBuffer2D :: Ptr CFloat -> CInt -> CInt -> IO (Ptr BufferPrim)
+foreign import ccall "XLA_Print" xlaPrint :: Ptr BufferPrim -> IO ()
+foreign import ccall "XLA_Create" xlaCreate :: Ptr CChar -> CInt -> Ptr (Ptr BufferPrim) -> IO (Ptr BufferPrim)
+foreign import ccall "XLA_Init" xlaInit :: IO ()
+foreign import ccall "XLA_Destructor" xlaRemove :: CInt -> FunPtr (Ptr BufferPrim -> IO ())
 
 type Code a = TExpQ a
 type Size2D = (Int, Int)
 data Size = Dim2R Int Int | Dim2 Int Int | Dim1 Int | Dim0
   deriving (Eq, Show, Lift)
-data Buffer = Device (Ptr BufferPrim) Size | Const Float
+data Buffer = Device (ForeignPtr BufferPrim) Size | Const Float
 type TreeRaw = Tree (Int, Size)
 type Tensor = Buffer
 type Layer = (Code ((Tensor, Tensor, Tensor) -> Tensor), Code ((Tensor, Tensor, Tensor) -> Tensor -> Tensor -> (Tensor, Tensor, Tensor)))
@@ -132,17 +142,17 @@ change (Constant f) = do
 change (Identity n) = do
   return (Identity n, [])
 
-run' :: Tree Buffer -> IO Buffer
-run' tree = do
+run :: Tree Buffer -> Buffer
+run tree = unsafePerformIO do
   let ((tree', xs), _) = runState (change tree) 0
   let (code, size) = evalTop tree'
-  putStrLn code
+  putStrLn "running hlo"
   code' <- newCString code
-  arr <- newArray (map (\(Device x _) -> x) xs)
-  putStrLn $ "len " ++ show (length xs)
-  return $ Device ({# call pure XLA_Create as ^ #} code' (fromIntegral (length xs)) arr) size
-
-run = unsafePerformIO . run'
+  arr <- newArray (map (\(Device x _) -> unsafeForeignPtrToPtr x) xs)
+  --putStrLn $ "len " ++ show (length xs)
+  t <- xlaCreate code' (fromIntegral (length xs)) arr
+  t' <- newForeignPtr (xlaRemove (fromIntegral 0)) t
+  return $ Device t' size
 
 evalTop :: TreeRaw -> (String, Size)
 evalTop tree = (unlines $ [
@@ -360,17 +370,19 @@ create2D :: Size2D -> [Float] -> Buffer
 create2D (m, n) list = unsafePerformIO do
   when (m * n /= length list) (error "Size Mismatch")
   arr <- newArray (map CFloat list)
-  t <- {# call unsafe XLA_CreateBuffer2D as ^ #} arr (fromIntegral m) (fromIntegral n)
+  t <- xlaCreateBuffer2D arr (fromIntegral m) (fromIntegral n)
+  t' <- newForeignPtr (xlaRemove (fromIntegral 0)) t
   free arr
-  return $ Device t (Dim2 m n)
+  return $ Device t' (Dim2 m n)
 
 create1D :: [Float] -> Buffer
 create1D list = unsafePerformIO do
   arr <- newArray (map CFloat list)
   let len = length list
-  t <- {# call unsafe XLA_CreateBuffer1D as ^ #} arr (fromIntegral len)
+  t <- xlaCreateBuffer arr (fromIntegral len)
+  t' <- newForeignPtr (xlaRemove (fromIntegral 0)) t
   free arr
-  return $ Device t (Dim1 len)
+  return $ Device t' (Dim1 len)
 
 {-let arr = listArray ((0, 0), (m, n)) list in
 let (_, ptr) = toForeignPtr arr in
@@ -398,8 +410,8 @@ mul :: [TExpQ Buffer] -> TExpQ (Buffer -> Buffer)
 mul [] = [|| \a -> a ||]
 mul (x:xs) = [|| \a -> $$x * $$(mul xs) a ||]
 
-printView (Device a _) = {# call unsafe XLA_Print as ^ #} a
-initialise = {# call unsafe XLA_Init as ^ #}
+printView (Device a _) = xlaPrint (unsafeForeignPtrToPtr a)
+initialise = xlaInit
 
 c = Const . fromIntegral
 c' = Const

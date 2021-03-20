@@ -1,4 +1,4 @@
-{-# LANGUAGE ForeignFunctionInterface, TypeApplications, FlexibleInstances, TemplateHaskell, BlockArguments #-}
+{-# LANGUAGE TypeApplications, FlexibleInstances, TemplateHaskell, BlockArguments #-}
 module Main where
 
 import Prelude hiding (sin, sum)
@@ -109,16 +109,17 @@ get (m, n) = do
   biases <- makeR' n 0.1
   return (weights, biases)
 
-doBatch :: [(Tensor, Tensor)] -> Tensor -> Tensor -> [[Float]] -> [(Tensor, Tensor)]
-doBatch weights _ _ [] = weights
-doBatch weights x y (b:bs) =
-  let z = make' b in
-  let size = len z in
-  let x' = gather x (reshape z (Dim2 size 1)) in
-  let y' = gather (reshape y (Dim2 60000 1)) (reshape z (Dim2 size 1)) in
-  let y'' = gather (identity 10) (reshape y' (Dim2 size 1)) in
-  let p = reverse ($$(compute layers) weights y'' x') in
-  doBatch (zipWith (update stepSize) weights p) x y bs
+doBatch :: [(Tensor, Tensor)] -> Tensor -> Tensor -> [[Float]] -> Int -> IO [(Tensor, Tensor)]
+doBatch weights _ _ [] _ = return weights
+doBatch weights x y (b:bs) n = do
+  print $ "iteration " ++ show n
+  let z = make' b
+  let size = len z
+  let x' = gather x (reshape z (Dim2 size 1))
+  let y' = gather (reshape y (Dim2 60000 1)) (reshape z (Dim2 size 1))
+  let y'' = gather (identity 10) (reshape y' (Dim2 size 1))
+  let p = reverse ($$(compute layers) weights y'' x')
+  doBatch (zipWith (update stepSize) weights p) x y bs (n + 1)
 
 main = do
   initialise
@@ -140,13 +141,13 @@ main = do
   let p'' = $$(backwardPass (reverse layers)) (reverse initial) (reverse p) delta
   --let res = reduceArgMax preds
   --let res2 = eq (reshape res (Dim2 128 1)) y'-}
-  let p = doBatch initial x y (take 50 batch)
+  p <- doBatch initial x y (take 100 batch) 0
   let res = $$(forwardPass layers) p x
   let res' = eq y (reduceArgMax (softmax (last res)))
   let res'' = mean res'
   printView (gather (fst $ p !! 1) (reshape other (Dim2 10 1)))
   --printView (snd $ last p'')
-  print $ (take 1 batch)
+  --print $ (take 50 batch)
   print $ length p
   printView res'' --(mean (reshape res2 (Dim1 128)))
 
