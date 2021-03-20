@@ -19,6 +19,7 @@ import Control.Monad.Random
 import Data.Array.ST
 import Control.Monad.ST
 import GHC.Arr
+import Data.Random.Normal
 
 -- pure function
 --foreign import ccall "hashan" c_sin :: CDouble -> CDouble
@@ -38,12 +39,10 @@ make' =  create1D
 
 c = Const . fromIntegral
 c' = Const
-broadcast s =  run . unaryEval (Broadcast (Dim1 s)) . Parameter
 
 sum x = run (binEval ReduceAdd (Parameter x) (Parameter 0))
 mean x = sum x / c (len x)
-softmax x = exp x / (broadcast (len x) (sum (exp x)))
-square x = x * x
+softmax x = exp x / (broadcast' (rows x, cols x) (sum (exp x)))
 
 f = do
   initialise
@@ -88,49 +87,14 @@ shuffle xs = do
         return ar
   return (elems ar)
 
-makeR (m, n) = do
+makeR (m, n) scale = do
   let len = m * n
-  values <- getRandoms
-  return (create2D (m, n) (take len values))
+  values <- normalsIO
+  return (create2D (m, n) (map (* scale) (take len values)))
 
-makeR' m = do
-  values <- getRandoms
-  return (create1D (take m values))
-
-type Code a = TExpQ a
-type Tensor = Buffer
-type Layer = (Code ((Tensor, Tensor, Tensor) -> Tensor), Code ((Tensor, Tensor, Tensor) -> Tensor -> Tensor -> (Tensor, Tensor, Tensor)))
-
-transpose a = run (unaryEval Transpose (Parameter a))
-
-linearTanh :: Layer
-linearTanh = (
-    [|| \(w, b, x) -> tanh (x @@ w + b) ||], 
-    [|| \(w, b, x) a deltaA -> 
-        let deltaZ = deltaA * (1 - square a) in
-        let deltaW = transpose x @@ deltaZ in
-        let deltaB = 1 @@ deltaZ in
-        let deltaX = deltaZ @@ transpose w in
-        (deltaW, deltaB, deltaX) ||]
-  )
-
-linear :: Layer
-linear = (
-    [|| \(w, b, x) -> x @@ w + b ||], 
-    [|| \(w, b, x) _ deltaZ -> 
-        let deltaW = transpose x @@ deltaZ in
-        let deltaB = 1 @@ deltaZ in
-        let deltaX = deltaZ @@ transpose w in
-        (deltaW, deltaB, deltaX) ||]
-  )
-
-forwardPass :: [Layer] -> Code ([(Tensor, Tensor)] -> Tensor -> [Tensor])
-forwardPass [] = [|| \[] _ -> [] ||]
-forwardPass ((l1, l2):ls) 
-  = [|| \((x1, x2):xs) y ->
-      let tmp = $$l1 (x1, x2, y) in
-      tmp : $$(forwardPass ls) xs tmp
-    ||]
+makeR' m scale = do
+  values <- normalsIO
+  return (create1D (map (* scale) (take m values)))
 
 backwardPass :: [Layer] -> Code ([(Tensor, Tensor)] -> [Tensor] -> Tensor -> [(Tensor, Tensor)])
 backwardPass ((l1, l2):ls)
@@ -157,27 +121,43 @@ trainDataSrc = "../data/train-images-idx3-ubyte"
 trainLabelsSrc = "../data/train-labels-idx1-ubyte"
 batchSize = 128
 
+{-
+784 -> 1024 -> 1024 -> 10 
+-}
+
+get :: (Int, Int) -> IO (Tensor, Tensor)
+get (m, n) = do
+  weights <- makeR (m, n) 0.1
+  biases <- makeR' n 0.1
+  return (weights, biases)
+
 main = do
   initialise
   Just images <- decodeIDXFile trainDataSrc
   Just (IDXLabels labels) <- decodeIDXLabelsFile trainLabelsSrc
-  print $ idxDimensions images
-  --printView =<< (makeR' 4)
-  {-let y = create2D (60000, 10) (concatMap oneHotEncode (V.toList labels))
+  let z = make' [0..9]
+  let y = create1D (map fromIntegral (V.toList labels))
   let x = create2D (60000, 28 * 28) (map fromIntegral (V.toList (idxIntContent images)))
-  print $ getSize x
-  print $ getSize y-}
-  let a = make [[1,2,3],[3,4,2],[6,4,3]]
-  let b = run (unaryEval ReduceArgMax (Parameter a)) --make' [2,2,3,4,5,7]
-  --let c = a `eq` b
-  printView b
+  initial <- mapM get [ (784, 1024)
+                      , (1024, 1024)
+                      , (1024, 10)]
+  let p = $$(forwardPass layers) initial x
   batch <- chunksOf batchSize <$> shuffle [0..59999]
   print $ head batch
-  
-{-let a = make [[1,2],[3,4],[5,6]]
+  print $ (length p)
+  let res = reduceArgMax (softmax (last p))
+  let res2 = eq res y
+  --printView (gather (reshape res2 (Dim2 60000 1)) (reshape z (Dim2 10 1)))
+  printView (mean res2)
+
+{-print $ idxDimensions images
+  let a = make [[1,2],[3,4],[5,6]]
   let b = make' [1, 0]
   let (Parameter c) = gather a (reshape b (Dim2 2 1))
-  printView c-}
+  printView c
+  print $ getSize x
+  print $ getSize y
+-}
 
 {- (Parameter x, Parameter y) <- f
   print (x, y)

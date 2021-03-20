@@ -21,11 +21,14 @@ import Control.Monad (when)
 --finalizer XLA_Remove as ^
 {#pointer *Buffer as BufferPrim foreign newtype#}
 
+type Code a = TExpQ a
 type Size2D = (Int, Int)
 data Size = Dim2R Int Int | Dim2 Int Int | Dim1 Int | Dim0
   deriving (Eq, Show, Lift)
 data Buffer = Device (Ptr BufferPrim) Size | Const Float
 type TreeRaw = Tree (Int, Size)
+type Tensor = Buffer
+type Layer = (Code ((Tensor, Tensor, Tensor) -> Tensor), Code ((Tensor, Tensor, Tensor) -> Tensor -> Tensor -> (Tensor, Tensor, Tensor)))
 
 data BinOp
   = Add
@@ -67,6 +70,7 @@ data CompOp
 
 data Tree a
   = Constant Float
+  | Identity Int
   | Parameter a
   | BinEval BinOp (Tree a) (Tree a)
   | UnaryEval UnaryOp (Tree a)
@@ -125,6 +129,8 @@ change (UnaryEval unOp tree) = do
   return (UnaryEval unOp tree', result)
 change (Constant f) = do
   return (Constant f, [])
+change (Identity n) = do
+  return (Identity n, [])
 
 run' :: Tree Buffer -> IO Buffer
 run' tree = do
@@ -224,7 +230,8 @@ norm x = x
 
 compat' Dim0 Dim0 = True
 compat' (Dim1 m) (Dim1 n) = m == n
-compat' (Dim2 m1 m2) (Dim2 n1 n2) = m1 == m2 && n1 == n2
+compat' (Dim2 m1 m2) (Dim2 n1 n2) = m1 == n1 && m2 == n2
+compat' m n = error $ "here " ++ show m ++ ", " ++ (show n)
 
 compat m n = compat' (norm m) (norm n)
 
@@ -239,8 +246,10 @@ eval (UnaryEval (Broadcast size) tree) = do
   where compat Dim0 (Dim2R _ _) = error "Size Mismatch"
         compat Dim0 _ = [("dimensions", "{}")]
         compat (Dim1 m) (Dim2 n1 n2)
+          | m == n1 && m == n2 = error "Ambiguous"
           | m == n2 = [("dimensions", "{1}")]
-        compat _ _ = error "Size Mismatch"
+          | m == n1 = [("dimensions", "{0}")]
+        compat m n = error $ "Size Mismatch " ++ show m ++ ", " ++ show n
 
 eval (UnaryEval Transpose tree) = do
   (result, loc, size) <- eval tree
@@ -331,10 +340,20 @@ eval (BinEval op treeA treeB) = do
   let opStr = fromJust $ lookup op binary
   if size `compat` size'
     then complete size opStr (result ++ result') [loc, loc'] []
-    else error "Size Mismatch"
+    else error $ "Size Mismatch " ++ opStr ++ " " ++ show size ++ " " ++ show size'
 
 eval (Constant f) = do
   complete Dim0 "constant" [] [show f] []
+
+eval (Identity n) = do
+  st <- get
+  let size = show n ++ "," ++ show n
+  let op1 = "  iota." ++ show st ++ " = s32[" ++ size ++ "] iota(), iota_dimension=0"
+  let op2 = "  iota." ++ show (st + 1) ++ " = s32[" ++ size ++ "] iota(), iota_dimension=1"
+  let op3 = "  compare." ++ show (st + 2) ++ " = pred[" ++ size ++ 
+              "]{1,0} compare(iota." ++ show st ++ ", iota." ++ show (st + 1) ++ "), direction=EQ"
+  put (st + 3)
+  complete (Dim2 n n) "convert" [op1, op2, op3] ["compare." ++ show (st + 2)] []
 
 create2D :: Size2D -> [Float] -> Buffer
 create2D (m, n) list = unsafePerformIO do
@@ -380,3 +399,41 @@ mul (x:xs) = [|| \a -> $$x * $$(mul xs) a ||]
 
 printView (Device a _) = {# call unsafe XLA_Print as ^ #} a
 initialise = {# call unsafe XLA_Init as ^ #}
+
+forwardPass :: [Layer] -> Code ([(Tensor, Tensor)] -> Tensor -> [Tensor])
+forwardPass [] = [|| \[] _ -> [] ||]
+forwardPass ((l1, l2):ls) 
+  = [|| \((x1, x2):xs) y ->
+      let tmp = $$l1 (x1, x2, y) in
+      tmp : $$(forwardPass ls) xs tmp
+    ||]
+
+layers = [linearTanh, linearTanh, linear]
+
+transpose a = run (unaryEval Transpose (Parameter a))
+reduceArgMax a = run (unaryEval ReduceArgMax (Parameter a))
+
+linearTanh :: Layer
+linearTanh = (
+    [|| \(w, b, x) -> tanh (x @@ w + (broadcast' (rows x, cols w) b)) ||], 
+    [|| \(w, b, x) a deltaA -> 
+        let deltaZ = deltaA * (1 - square a) in
+        let deltaW = transpose x @@ deltaZ in
+        let deltaB = 1 @@ deltaZ in
+        let deltaX = deltaZ @@ transpose w in
+        (deltaW, deltaB, deltaX) ||]
+  )
+
+square x = x * x
+broadcast s =  run . unaryEval (Broadcast (Dim1 s)) . Parameter
+broadcast' (m, n) =  run . unaryEval (Broadcast (Dim2 m n)) . Parameter
+
+linear :: Layer
+linear = (
+    [|| \(w, b, x) -> x @@ w + (broadcast' (rows x, cols w) b) ||], 
+    [|| \(w, b, x) _ deltaZ -> 
+        let deltaW = transpose x @@ deltaZ in
+        let deltaB = 1 @@ deltaZ in
+        let deltaX = deltaZ @@ transpose w in
+        (deltaW, deltaB, deltaX) ||]
+  )
