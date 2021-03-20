@@ -3,7 +3,7 @@ module Lib where
 
 import Language.Haskell.TH.Lib
 import Language.Haskell.TH.Syntax
-import Prelude
+import Prelude hiding (sum)
 import Foreign.C.String
 import Foreign.C
 import Foreign.Ptr (Ptr, nullPtr)
@@ -231,7 +231,8 @@ norm x = x
 compat' Dim0 Dim0 = True
 compat' (Dim1 m) (Dim1 n) = m == n
 compat' (Dim2 m1 m2) (Dim2 n1 n2) = m1 == n1 && m2 == n2
-compat' m n = error $ "here " ++ show m ++ ", " ++ (show n)
+compat' _ _ = False
+--compat' m n = error $ "here " ++ show m ++ ", " ++ (show n)
 
 compat m n = compat' (norm m) (norm n)
 
@@ -303,7 +304,7 @@ eval (BinEval Dot treeA treeB) = do
           | m2 == n1 = Dim2 m1 n2
         compat' (Dim1 m) (Dim1 n)
           | m == n = Dim0
-        compat' _ _ = error "Size Mismatch"
+        compat' m n = error $ "Size Mismatch, " ++ show m ++ ", " ++ show n
 
 eval (BinEval Gather treeA treeB) = do
   (result, loc, size) <- eval treeA
@@ -400,12 +401,32 @@ mul (x:xs) = [|| \a -> $$x * $$(mul xs) a ||]
 printView (Device a _) = {# call unsafe XLA_Print as ^ #} a
 initialise = {# call unsafe XLA_Init as ^ #}
 
+c = Const . fromIntegral
+c' = Const
+
+compute layers
+  = [|| \weights targets input -> 
+      let activations = $$(forwardPass layers) weights input in
+      let preds = softmax (last activations) in
+      --let loss = negate (mean (sum (log preds * targets))) in
+      let delta = (preds - targets) / (broadcast' (rows input, 10) (c (rows input))) in
+      $$(backwardPass (reverse layers)) (reverse weights) (reverse activations) delta
+    ||]
+
 forwardPass :: [Layer] -> Code ([(Tensor, Tensor)] -> Tensor -> [Tensor])
-forwardPass [] = [|| \[] _ -> [] ||]
+forwardPass [] = [|| \[] x -> [x] ||]
 forwardPass ((l1, l2):ls) 
   = [|| \((x1, x2):xs) y ->
       let tmp = $$l1 (x1, x2, y) in
-      tmp : $$(forwardPass ls) xs tmp
+      y : $$(forwardPass ls) xs tmp
+    ||]
+
+backwardPass :: [Layer] -> Code ([(Tensor, Tensor)] -> [Tensor] -> Tensor -> [(Tensor, Tensor)])
+backwardPass [] = [|| \[] [_] _ -> []||]
+backwardPass ((l1, l2):ls)
+  = [|| \((x1, x2):xs) (i1:i2:is) delta ->
+        let (a, b, c) = $$l2 (x1, x2, i2) i1 delta in
+        (a, b) : $$(backwardPass ls) xs (i2:is) c
     ||]
 
 layers = [linearTanh, linearTanh, linear]
@@ -417,13 +438,14 @@ linearTanh :: Layer
 linearTanh = (
     [|| \(w, b, x) -> tanh (x @@ w + (broadcast' (rows x, cols w) b)) ||], 
     [|| \(w, b, x) a deltaA -> 
-        let deltaZ = deltaA * (1 - square a) in
+        let deltaZ = deltaA * (broadcast' (rows a, cols a) 1 - square a) in
         let deltaW = transpose x @@ deltaZ in
-        let deltaB = 1 @@ deltaZ in
+        let deltaB = (broadcast' (1, rows x) 1) @@ deltaZ in
         let deltaX = deltaZ @@ transpose w in
-        (deltaW, deltaB, deltaX) ||]
+        (deltaW, reshape deltaB (Dim1 (cols deltaB)), deltaX) ||]
   )
 
+identity n = run (Identity n)
 square x = x * x
 broadcast s =  run . unaryEval (Broadcast (Dim1 s)) . Parameter
 broadcast' (m, n) =  run . unaryEval (Broadcast (Dim2 m n)) . Parameter
@@ -433,7 +455,11 @@ linear = (
     [|| \(w, b, x) -> x @@ w + (broadcast' (rows x, cols w) b) ||], 
     [|| \(w, b, x) _ deltaZ -> 
         let deltaW = transpose x @@ deltaZ in
-        let deltaB = 1 @@ deltaZ in
+        let deltaB = (broadcast' (1, rows x) 1) @@ deltaZ in
         let deltaX = deltaZ @@ transpose w in
-        (deltaW, deltaB, deltaX) ||]
+        (deltaW, reshape deltaB (Dim1 (cols deltaB)), deltaX) ||]
   )
+
+sum x = run (binEval ReduceAdd (Parameter x) (Parameter 0))
+mean x = sum x / c (len x)
+softmax x = exp x / (broadcast' (rows x, cols x) (sum (exp x)))

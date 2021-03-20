@@ -37,13 +37,6 @@ make a = create2D (length a, length (head a)) (concat a)
 make' :: [Float] -> Buffer
 make' =  create1D
 
-c = Const . fromIntegral
-c' = Const
-
-sum x = run (binEval ReduceAdd (Parameter x) (Parameter 0))
-mean x = sum x / c (len x)
-softmax x = exp x / (broadcast' (rows x, cols x) (sum (exp x)))
-
 f = do
   initialise
   let a = make [[1, 2], [3, 4]]
@@ -96,30 +89,15 @@ makeR' m scale = do
   values <- normalsIO
   return (create1D (map (* scale) (take m values)))
 
-backwardPass :: [Layer] -> Code ([(Tensor, Tensor)] -> [Tensor] -> Tensor -> [(Tensor, Tensor)])
-backwardPass ((l1, l2):ls)
-  = [|| \((x1, x2):xs) (i:is) delta ->
-        let (a, b, c) = $$l2 (x1, x2, i) i delta in
-        (a, b) : $$(backwardPass ls) xs is c
-    ||]
-
-compute layers
-  = [|| \weights targets input -> 
-      let activations = $$(forwardPass layers) weights input in
-      let preds = softmax (last activations) in
-      let loss = negate (mean (sum (log preds * targets))) in
-      let delta = (preds - targets) / c (rows input) in
-      $$(backwardPass layers) weights activations delta
-    ||]
-
 update :: Float -> (Tensor, Tensor) -> (Tensor, Tensor) -> (Tensor, Tensor)
-update stepSize (w, b) (deltaW, deltaB) = (w - c' stepSize * deltaW, b - c' stepSize * deltaB)
+update stepSize (w, b) (deltaW, deltaB) = (w - broadcast' (rows w, cols w) (c' stepSize) * deltaW, b - broadcast (len b) (c' stepSize) * deltaB)
 
 testDataSrc = "../data/t10k-images-idx3-ubyte"
 testLabelsSrc = "../data/t10k-labels-idx1-ubyte"
 trainDataSrc = "../data/train-images-idx3-ubyte"
 trainLabelsSrc = "../data/train-labels-idx1-ubyte"
 batchSize = 128
+stepSize = 0.001
 
 {-
 784 -> 1024 -> 1024 -> 10 
@@ -131,24 +109,46 @@ get (m, n) = do
   biases <- makeR' n 0.1
   return (weights, biases)
 
+doBatch :: [(Tensor, Tensor)] -> Tensor -> Tensor -> [[Float]] -> [(Tensor, Tensor)]
+doBatch weights _ _ [] = weights
+doBatch weights x y (b:bs) =
+  let z = make' b in
+  let size = len z in
+  let x' = gather x (reshape z (Dim2 size 1)) in
+  let y' = gather (reshape y (Dim2 60000 1)) (reshape z (Dim2 size 1)) in
+  let y'' = gather (identity 10) (reshape y' (Dim2 size 1)) in
+  let p = reverse ($$(compute layers) weights y'' x') in
+  doBatch (zipWith (update stepSize) weights p) x y bs
+
 main = do
   initialise
   Just images <- decodeIDXFile trainDataSrc
   Just (IDXLabels labels) <- decodeIDXLabelsFile trainLabelsSrc
-  let z = make' [0..9]
+  let other = make' [0..9]
   let y = create1D (map fromIntegral (V.toList labels))
   let x = create2D (60000, 28 * 28) (map fromIntegral (V.toList (idxIntContent images)))
   initial <- mapM get [ (784, 1024)
                       , (1024, 1024)
                       , (1024, 10)]
-  let p = $$(forwardPass layers) initial x
   batch <- chunksOf batchSize <$> shuffle [0..59999]
+  {-let p = $$(forwardPass layers) initial x'
   print $ head batch
   print $ (length p)
-  let res = reduceArgMax (softmax (last p))
-  let res2 = eq res y
-  --printView (gather (reshape res2 (Dim2 60000 1)) (reshape z (Dim2 10 1)))
-  printView (mean res2)
+  let preds = softmax (last p)
+  --let loss = negate (mean (sum (log preds * y')))
+  let delta = (preds - y'') / (broadcast' (rows x', 10) (c (rows x')))
+  let p'' = $$(backwardPass (reverse layers)) (reverse initial) (reverse p) delta
+  --let res = reduceArgMax preds
+  --let res2 = eq (reshape res (Dim2 128 1)) y'-}
+  let p = doBatch initial x y (take 50 batch)
+  let res = $$(forwardPass layers) p x
+  let res' = eq y (reduceArgMax (softmax (last res)))
+  let res'' = mean res'
+  printView (gather (fst $ p !! 1) (reshape other (Dim2 10 1)))
+  --printView (snd $ last p'')
+  print $ (take 1 batch)
+  print $ length p
+  printView res'' --(mean (reshape res2 (Dim1 128)))
 
 {-print $ idxDimensions images
   let a = make [[1,2],[3,4],[5,6]]
