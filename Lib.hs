@@ -1,4 +1,4 @@
-{-# LANGUAGE ForeignFunctionInterface, TypeApplications, DeriveLift, FlexibleInstances, TemplateHaskell, BlockArguments #-}
+{-# LANGUAGE ForeignFunctionInterface, BangPatterns, TypeApplications, DeriveLift, FlexibleInstances, TemplateHaskell, BlockArguments #-}
 module Lib where
 
 import Language.Haskell.TH.Lib
@@ -35,7 +35,7 @@ type Code a = TExpQ a
 type Size2D = (Int, Int)
 data Size = Dim2R Int Int | Dim2 Int Int | Dim1 Int | Dim0
   deriving (Eq, Show, Lift)
-data Buffer = Device (ForeignPtr BufferPrim) Size | Const Float
+data Buffer = Device !(ForeignPtr BufferPrim) Size | Const Float
 type TreeRaw = Tree (Int, Size)
 type Tensor = Buffer
 type Layer = (Code ((Tensor, Tensor, Tensor) -> Tensor), Code ((Tensor, Tensor, Tensor) -> Tensor -> Tensor -> (Tensor, Tensor, Tensor)))
@@ -95,6 +95,7 @@ instance Num Buffer where
   signum a = run (unaryEval Sign (Parameter a))                           
   fromInteger = Const . fromIntegral -- Constant (fromIntegral a)
   {-# INLINE (*) #-}
+  {-# INLINE (-) #-}
   {-# INLINE negate #-}
   {-# INLINE (+) #-}
 
@@ -107,6 +108,7 @@ reshape a s = run (unaryEval (Reshape s) (Parameter a))
 instance Fractional Buffer where
   a / b = run (binEval Divide (Parameter a) (Parameter b))
   fromRational a = undefined
+  {-# INLINE (/) #-}
 
 instance Floating Buffer where
   pi = undefined
@@ -120,6 +122,9 @@ instance Floating Buffer where
   asinh = undefined
   acosh = undefined
   atanh = undefined
+  {-# INLINE exp #-}
+  {-# INLINE tanh #-}
+  {-# INLINE log #-}
 
 getSize :: Buffer -> Size
 getSize (Device a b) = b
@@ -146,7 +151,7 @@ run :: Tree Buffer -> Buffer
 run tree = unsafePerformIO do
   let ((tree', xs), _) = runState (change tree) 0
   let (code, size) = evalTop tree'
-  putStrLn "running hlo"
+  --putStrLn "running hlo"
   code' <- newCString code
   arr <- newArray (map (\(Device x _) -> unsafeForeignPtrToPtr x) xs)
   --putStrLn $ "len " ++ show (length xs)
@@ -357,13 +362,13 @@ eval (Constant f) = do
   complete Dim0 "constant" [] [show f] []
 
 eval (Identity n) = do
-  st <- get
+  st <- get 
   let size = show n ++ "," ++ show n
   let op1 = "  iota." ++ show st ++ " = s32[" ++ size ++ "] iota(), iota_dimension=0"
   let op2 = "  iota." ++ show (st + 1) ++ " = s32[" ++ size ++ "] iota(), iota_dimension=1"
   let op3 = "  compare." ++ show (st + 2) ++ " = pred[" ++ size ++ 
               "]{1,0} compare(iota." ++ show st ++ ", iota." ++ show (st + 1) ++ "), direction=EQ"
-  put (st + 3)
+  put (st + 3) 
   complete (Dim2 n n) "convert" [op1, op2, op3] ["compare." ++ show (st + 2)] []
 
 create2D :: Size2D -> [Float] -> Buffer
@@ -393,13 +398,27 @@ unaryEval = UnaryEval
 
 {-# INLINE[1] binEval #-}
 {-# INLINE[1] unaryEval #-}
-{-# INLINE CONLIKE [1] run #-}
+{-# INLINE[1] run #-}
+{-# INLINE square #-}
+{-# INLINE (@@) #-}
+{-# INLINE reshape #-}
+{-# INLINE gather #-}
+{-# INLINE broadcast' #-}
+{-# INLINE broadcast #-}
+{-# INLINE sum #-}
+{-# INLINE eq #-}
+{-# INLINE softmax #-}
+{-# INLINE mean #-}
+{-# INLINE identity #-}
+--{-# INLINE transpose #-}
+--{-# INLINE reduceArgMax #-}
+-- {-# INLINE CONLIKE [1] run #-}
 
-{-# RULES "fusable/aux1" forall x y z.
+{-# RULES "hashan/binEvalRight" forall x y z.
       binEval x y (Parameter (run z)) = binEval x y z ; #-}
-{-# RULES "fusable/aux2" forall x y z.
+{-# RULES "hashan/binEvalLeft" forall x y z.
       binEval x (Parameter (run y)) z = binEval x y z ; #-}
-{-# RULES "fusable/aux3" forall x y.
+{-# RULES "hashan/unaryEval" forall x y.
       unaryEval x (Parameter (run y)) = unaryEval x y ; #-}
 
 power ::  (Num a) => Int -> TExpQ (a -> a)
@@ -420,9 +439,10 @@ compute layers
   = [|| \weights targets input -> 
       let activations = $$(forwardPass layers) weights input in
       let preds = softmax (last activations) in
-      --let loss = negate (mean (sum (log preds * targets))) in
+      let !loss = negate (mean (sum (log preds * targets))) in
       let delta = (preds - targets) / (broadcast' (rows input, 10) (c (rows input))) in
-      $$(backwardPass (reverse layers)) (reverse weights) (reverse activations) delta
+      let !backward = $$(backwardPass (reverse layers)) (reverse weights) (reverse activations) delta in
+      (backward, loss)
     ||]
 
 forwardPass :: [Layer] -> Code ([(Tensor, Tensor)] -> Tensor -> [Tensor])
@@ -437,7 +457,7 @@ backwardPass :: [Layer] -> Code ([(Tensor, Tensor)] -> [Tensor] -> Tensor -> [(T
 backwardPass [] = [|| \[] [_] _ -> []||]
 backwardPass ((l1, l2):ls)
   = [|| \((x1, x2):xs) (i1:i2:is) delta ->
-        let (a, b, c) = $$l2 (x1, x2, i2) i1 delta in
+        let (!a, !b, !c) = $$l2 (x1, x2, i2) i1 delta in
         (a, b) : $$(backwardPass ls) xs (i2:is) c
     ||]
 

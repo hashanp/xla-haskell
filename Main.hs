@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeApplications, FlexibleInstances, TemplateHaskell, BlockArguments #-}
+{-# LANGUAGE TypeApplications, FlexibleInstances, BangPatterns, TemplateHaskell, BlockArguments #-}
 module Main where
 
 import Prelude hiding (sin, sum)
@@ -8,7 +8,7 @@ import Foreign.C.String
 import Foreign.C
 import Foreign.Ptr (Ptr, nullPtr)
 import Data.Maybe (fromJust)
---import System.Mem
+import System.Mem
 import Foreign.Marshal.Array
 import Foreign.Marshal.Alloc
 import System.IO.Unsafe (unsafePerformIO)
@@ -118,8 +118,10 @@ doBatch weights x y (b:bs) n = do
   let x' = gather x (reshape z (Dim2 size 1))
   let y' = gather (reshape y (Dim2 60000 1)) (reshape z (Dim2 size 1))
   let y'' = gather (identity 10) (reshape y' (Dim2 size 1))
-  let p = reverse ($$(compute layers) weights y'' x')
-  doBatch (zipWith (update stepSize) weights p) x y bs (n + 1)
+  let (!p, !loss) = $$(compute layers) weights y'' x'
+  printView loss
+  performMajorGC
+  doBatch (zipWith (update stepSize) weights (reverse p)) x y bs (n + 1)
 
 main = do
   initialise
@@ -141,11 +143,11 @@ main = do
   let p'' = $$(backwardPass (reverse layers)) (reverse initial) (reverse p) delta
   --let res = reduceArgMax preds
   --let res2 = eq (reshape res (Dim2 128 1)) y'-}
-  p <- doBatch initial x y (take 100 batch) 0
+  p <- doBatch initial x y (take 400 batch) 0
   let res = $$(forwardPass layers) p x
   let res' = eq y (reduceArgMax (softmax (last res)))
   let res'' = mean res'
-  printView (gather (fst $ p !! 1) (reshape other (Dim2 10 1)))
+  --printView (gather (fst $ p !! 1) (reshape other (Dim2 10 1)))
   --printView (snd $ last p'')
   --print $ (take 50 batch)
   print $ length p
