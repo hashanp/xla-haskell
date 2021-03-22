@@ -398,7 +398,8 @@ unaryEval = UnaryEval
 
 {-# INLINE[1] binEval #-}
 {-# INLINE[1] unaryEval #-}
-{-# INLINE[1] run #-}
+--{-# INLINE[1] run #-}
+{-# NOINLINE run #-}
 {-# INLINE square #-}
 {-# INLINE (@@) #-}
 {-# INLINE reshape #-}
@@ -410,8 +411,8 @@ unaryEval = UnaryEval
 {-# INLINE softmax #-}
 {-# INLINE mean #-}
 {-# INLINE identity #-}
---{-# INLINE transpose #-}
---{-# INLINE reduceArgMax #-}
+{-# INLINE transpose #-}
+{-# INLINE reduceArgMax #-}
 -- {-# INLINE CONLIKE [1] run #-}
 
 {-# RULES "hashan/binEvalRight" forall x y z.
@@ -430,7 +431,7 @@ mul [] = [|| \a -> a ||]
 mul (x:xs) = [|| \a -> $$x * $$(mul xs) a ||]
 
 printView (Device a _) = xlaPrint (unsafeForeignPtrToPtr a)
-initialise = xlaInit
+initialise = xlaInit 
 
 c = Const . fromIntegral
 c' = Const
