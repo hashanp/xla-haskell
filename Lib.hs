@@ -27,7 +27,7 @@ data BufferPrim
 foreign import ccall "XLA_CreateBuffer1D" xlaCreateBuffer :: Ptr CFloat -> CInt -> IO (Ptr BufferPrim)
 foreign import ccall "XLA_CreateBuffer2D" xlaCreateBuffer2D :: Ptr CFloat -> CInt -> CInt -> IO (Ptr BufferPrim)
 foreign import ccall "XLA_Print" xlaPrint :: Ptr BufferPrim -> IO ()
-foreign import ccall "XLA_Create" xlaCreate :: Ptr CChar -> CInt -> Ptr (Ptr BufferPrim) -> IO (Ptr BufferPrim)
+foreign import ccall "XLA_Create" xlaCreate :: Ptr CChar -> CInt -> Ptr (Ptr BufferPrim) -> IO (Ptr (Ptr BufferPrim))
 foreign import ccall "XLA_Init" xlaInit :: IO ()
 foreign import ccall "XLA_Destructor" xlaRemove :: CInt -> FunPtr (Ptr BufferPrim -> IO ())
 
@@ -147,8 +147,8 @@ change (Constant f) = do
 change (Identity n) = do
   return (Identity n, [])
 
-run :: Tree Buffer -> Buffer
-run tree = unsafePerformIO do
+runInner :: [Tree Buffer] -> Buffer
+runInner [tree] = unsafePerformIO do
   let ((tree', xs), _) = runState (change tree) 0
   let (code, size) = evalTop tree'
   --putStrLn "running hlo"
@@ -156,8 +156,11 @@ run tree = unsafePerformIO do
   arr <- newArray (map (\(Device x _) -> unsafeForeignPtrToPtr x) xs)
   --putStrLn $ "len " ++ show (length xs)
   t <- xlaCreate code' (fromIntegral (length xs)) arr
-  t' <- newForeignPtr (xlaRemove (fromIntegral 0)) t
-  return $ Device t' size
+  t' <- peekArray 1 t
+  t'' <- newForeignPtr (xlaRemove (fromIntegral 0)) (t' !! 0)
+  return $ Device t'' size
+
+run a = runInner [a]
 
 evalTop :: TreeRaw -> (String, Size)
 evalTop tree = (unlines $ [
@@ -181,10 +184,10 @@ evalTop tree = (unlines $ [
   "}",
   "",
   "ENTRY xla_comp.0 {"] ++
-  init result ++
-  ["  ROOT" ++ tail (last result), -- "  ROOT tuple." ++ (show st) ++ " = (f32[2,2]{1,0}) " ++ loc ++ "",
+  result ++
+  ["  ROOT tuple." ++ (show st) ++ " = (" ++ showSize size ++ ") tuple(" ++ loc ++ ")",
   "}"], size)
-  where ((result, loc, size), _) = runState (eval tree) 1
+  where ((result, loc, size), st) = runState (eval tree) 1
 
 unary op = case op of
   Sine -> "sine"
@@ -398,8 +401,9 @@ unaryEval = UnaryEval
 
 {-# INLINE[1] binEval #-}
 {-# INLINE[1] unaryEval #-}
---{-# INLINE[1] run #-}
-{-# NOINLINE run #-}
+{-# INLINE[1] run #-}
+{-# NOINLINE runInner #-}
+--{-# NOINLINE run #-}
 {-# INLINE square #-}
 {-# INLINE (@@) #-}
 {-# INLINE reshape #-}
