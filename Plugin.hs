@@ -17,6 +17,9 @@ import CoreFVs (exprFreeVars)
 import VarSet (VarSet, elemVarSet)
 import Debug.Trace (trace)
 import HscTypes (lookupTyCon)
+import Type (mkTyConApp)
+import FastString (fsLit)
+import CoreUtils (exprType)
 
 plugin :: Plugin
 plugin = defaultPlugin 
@@ -24,7 +27,7 @@ plugin = defaultPlugin
   , pluginRecompile = purePlugin
   }
 
-data State = State { getRun :: Name, getTree :: TyCon, getBuffer :: TyCon }
+data State = State { getRealRun :: Name, getRun :: Name, getRunId :: Id, getTree :: TyCon, getBuffer :: TyCon, getError :: Id }
 
 transformProgram :: ModGuts -> CoreM ModGuts
 transformProgram guts = do
@@ -32,13 +35,17 @@ transformProgram guts = do
   mod' <- liftIO $ findImportedModule hscEnv (mkModuleName "Lib") Nothing
   --mod'' <- liftIO $ findImportedModule hscEnv (mkModuleName "GHC.Types") Nothing
   let (Found _ mod) = mod'
+  realRun <- liftIO $ lookupOrigIO hscEnv mod (mkVarOcc "run")
   name <- liftIO $ lookupOrigIO hscEnv mod (mkVarOcc "runInner")
   name' <- liftIO $ lookupOrigIO hscEnv mod (mkTcOcc "Tree")
   name'' <- liftIO $ lookupOrigIO hscEnv mod (mkTcOcc "Buffer")
+  name''' <- liftIO $ lookupOrigIO hscEnv mod (mkVarOcc "shouldNotBeReachable")
   tyCon <- lookupTyCon name'
   tyCon' <- lookupTyCon name''
+  id <- lookupId name'''
+  runId <- lookupId name
   putMsgS (showSDocUnsafe $ ppr name)
-  newBinds <- mapM (transformFunc (State { getRun = name, getTree = tyCon, getBuffer = tyCon' }) guts) (mg_binds guts)
+  newBinds <- mapM (transformFunc (State { getRealRun = realRun, getRun = name, getRunId = runId, getTree = tyCon, getBuffer = tyCon', getError = id }) guts) (mg_binds guts)
   return $ guts { mg_binds = newBinds }
 
 transformFunc :: State -> ModGuts -> CoreBind -> CoreM CoreBind
@@ -55,7 +62,7 @@ shouldTransformBind guts _ = return True
 getNames (NonRec b _) = [b]
 getNames (Rec bs) = map (\(a, b) -> a) bs 
 
-matchesRun st (Var x) = varName x == getRun st
+matchesRun st (Var x) = varName x == getRealRun st
 matchesRun _ _ = False
 
 matchesNil (Var x) = x == dataConWorkId nilDataCon
@@ -81,33 +88,98 @@ convert st e@(App (App (App cons (Type ty)) e1) e2)
 convert st e = Nothing
   --error "here"
 
-data RunExpr = RunExpr CoreExpr [CoreExpr] VarSet
+data RunExpr = RunExpr [Var] [CoreExpr] VarSet
 type Info = [RunExpr]
 
 notPresent x (RunExpr _ _ varSet) = not $ x `elemVarSet` varSet
 
+getType :: State -> CoreExpr
+getType st = Type $ mkTyConApp (getTree st) [mkTyConApp (getBuffer st) []]
+
+getType' :: State -> Type
+getType' st = mkTyConApp listTyCon [mkTyConApp (getBuffer st) []]
+
+getType'' :: State -> Type
+getType'' st = mkTyConApp (getBuffer st) []
+
+createRun :: State -> [CoreExpr] -> CoreM CoreExpr
+createRun st [] = do
+  return $ App (Var (dataConWorkId nilDataCon)) (getType st)
+createRun st (x:xs) = do
+  rest <- createRun st xs
+  return $ App (App (App (Var (dataConWorkId consDataCon)) (getType st)) x) rest
+
+names' :: State -> [CoreExpr] -> CoreM [Var]
+names' _ [] = return []
+names' st (x:xs) = do
+  xs' <- names' st xs
+  var2 <- mkSysLocalM (fsLit "hashan2") (getType'' st)
+  return $ var2:xs'
+
+getAll :: Info -> ([Var], [CoreExpr])
+getAll [] = ([], [])
+getAll (RunExpr ns ls _:xs) = (ns ++ ns', ls ++ ls')
+  where (ns', ls') = getAll xs
+
+createDown :: State -> Type -> [Var] -> CoreExpr -> CoreExpr -> CoreM CoreExpr
+createDown _ _ [] _ e' = return e'
+createDown st ty (var2:ns) e e' = do
+  var1 <- mkSysLocalM (fsLit "hashan1") (getType' st)
+  var3 <- mkSysLocalM (fsLit "hashan3") (getType' st)
+  rest <- createDown st ty ns (Var var3) e'
+  return $ Case e var1 ty 
+    [(DataAlt consDataCon, [var2, var3], rest),
+     (DataAlt nilDataCon, [], Var (getError st))]
+
+make :: State -> Info -> CoreExpr -> CoreM CoreExpr
+make st info e = do
+  let (ns, ls) = getAll info
+  run <- createRun st ls
+  let expr = App (Var (getRunId st)) run
+  createDown st (exprType e) ns expr e
+
+{-
+names :: Info -> [(CoreExpr, [Name])]
+names = mapM (\(RunExpr a b _) -> (a,) <$> )-}
+
+{--}
+
 transformBind :: State -> CoreBind -> CoreM CoreBind
-transformBind st (NonRec b e) = (NonRec b) <$> (fst <$> transformExpr st e)
-transformBind st (Rec bs) = Rec <$> (mapM (\(b, e) -> (b,) <$> fst <$> transformExpr st e) bs)
+transformBind st (NonRec b e) = (NonRec b) <$> (transformExpr' st e)
+transformBind st (Rec bs) = Rec <$> (mapM (\(b, e) -> (b,) <$> transformExpr' st e) bs)
+
+transformExpr' :: State -> CoreExpr -> CoreM CoreExpr
+transformExpr' st e = do
+  (e', info) <- transformExpr st e
+  case info of
+    [] -> return e'
+    _ -> make st info e'
 
 transformExpr :: State -> CoreExpr -> CoreM (CoreExpr, Info)
 
 transformExpr st e@(App e1 e2)
   | matchesRun st e1 = do
-        case convert st e2 of
+        {-case convert st e2 of
             Nothing -> do
                 putMsgS "fail"
                 return (e, [])
             Just a -> do
-                putMsgS "success"
-                return (e, [RunExpr e a (exprFreeVars e)])
+                --names <- names' st a-}
+        putMsgS "success"
+        var2 <- mkSysLocalM (fsLit "hashan2") (getType'' st)
+        --run <- createRun st (map Var names)
+        return (Var var2, [RunExpr [var2] [e2] (exprFreeVars e2)])
   | otherwise = do
         (e1', info1) <- transformExpr st e1
         (e2', info2) <- transformExpr st e2
         let e' = App e1' e2'
-        when ((not (null info1)) && (not (null info2))) do
-          putMsgS "join"
-        return (e', info1 ++ info2)
+        {-when ((not (null info1)) && (not (null info2))) do
+          putMsgS "join"-}
+        if ((not (null info1)) && (not (null info2)))
+          then do
+            ee <- make st (info1 ++ info2) e'
+            return (ee, [])
+          else return (e', info1 ++ info2)
 
 transformExpr st e@(Lam x e1) = do
   (e1', info) <- transformExpr st e1

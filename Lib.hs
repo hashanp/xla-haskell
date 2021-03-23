@@ -147,23 +147,30 @@ change (Constant f) = do
 change (Identity n) = do
   return (Identity n, [])
 
-runInner :: [Tree Buffer] -> Buffer
-runInner [tree] = unsafePerformIO do
-  let ((tree', xs), _) = runState (change tree) 0
+runHelper :: [Tree Buffer] -> State Int ([TreeRaw], [Buffer])
+runHelper [] = return ([], [])
+runHelper (x:xs) = do
+  (tree, params) <- change x
+  (tree', params') <- runHelper xs
+  return (tree:tree', params ++ params')
+
+runInner :: [Tree Buffer] -> [Buffer]
+runInner trees = unsafePerformIO do
+  let ((tree', xs), _) = runState (runHelper trees) 0
   let (code, size) = evalTop tree'
   --putStrLn "running hlo"
   code' <- newCString code
   arr <- newArray (map (\(Device x _) -> unsafeForeignPtrToPtr x) xs)
-  --putStrLn $ "len " ++ show (length xs)
+  -- putStrLn $ "len " ++ show (length xs)
   t <- xlaCreate code' (fromIntegral (length xs)) arr
-  t' <- peekArray 1 t
-  t'' <- newForeignPtr (xlaRemove (fromIntegral 0)) (t' !! 0)
-  return $ Device t'' size
+  t' <- peekArray (length trees) t
+  t'' <- mapM (newForeignPtr (xlaRemove (fromIntegral 0))) t'
+  return $ zipWith Device t'' size
 
-run a = runInner [a]
+run a = head $ runInner [a]
 
-evalTop :: TreeRaw -> (String, Size)
-evalTop tree = (unlines $ [
+evalTop :: [TreeRaw] -> (String, [Size])
+evalTop trees = (unlines $ [
   "HloModule xla_comp.0", 
   "",
   "primitive_computation_add.0 {",
@@ -184,10 +191,15 @@ evalTop tree = (unlines $ [
   "}",
   "",
   "ENTRY xla_comp.0 {"] ++
-  result ++
-  ["  ROOT tuple." ++ (show st) ++ " = (" ++ showSize size ++ ") tuple(" ++ loc ++ ")",
-  "}"], size)
-  where ((result, loc, size), st) = runState (eval tree) 1
+  concat results ++
+  ["  ROOT tuple." ++ (show st) ++ " = (" ++ sizes' ++ ") tuple(" ++ locs' ++ ")",
+  "}"], sizes)
+  where (triples, st) = (runState (mapM eval trees) 1) :: ([([String], String, Size)], Int)
+        sizes = map (\(a,b,c) -> c) triples
+        results = map (\(a,b,c) -> a) triples
+        locs = map (\(a,b,c) -> b) triples
+        sizes' = intercalate ", " (map showSize sizes)
+        locs' = intercalate ", " locs
 
 unary op = case op of
   Sine -> "sine"
@@ -222,6 +234,9 @@ rows (Device _ (Dim2R m _)) = m
 cols :: Buffer -> Int
 cols (Device _ (Dim2 _ n)) = n
 cols (Device _ (Dim2R _ n)) = n
+
+shouldNotBeReachable :: a
+shouldNotBeReachable = error "should not be reachable"
 
 showSize :: Size -> String
 showSize = showSize' "f32"
@@ -401,9 +416,9 @@ unaryEval = UnaryEval
 
 {-# INLINE[1] binEval #-}
 {-# INLINE[1] unaryEval #-}
-{-# INLINE[1] run #-}
-{-# NOINLINE runInner #-}
---{-# NOINLINE run #-}
+--{-# INLINE[1] run #-}
+--{-# NOINLINE runInner #-}
+{-# NOINLINE run #-}
 {-# INLINE square #-}
 {-# INLINE (@@) #-}
 {-# INLINE reshape #-}
