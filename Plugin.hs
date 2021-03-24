@@ -20,6 +20,8 @@ import HscTypes (lookupTyCon)
 import Type (mkTyConApp)
 import FastString (fsLit)
 import CoreUtils (exprType)
+import CoreMonad (SimplMode)
+import BasicTypes (CompilerPhase(..))
 
 plugin :: Plugin
 plugin = defaultPlugin 
@@ -27,7 +29,7 @@ plugin = defaultPlugin
   , pluginRecompile = purePlugin
   }
 
-data State = State { getRealRun :: Name, getRun :: Name, getRunId :: Id, getTree :: TyCon, getBuffer :: TyCon, getError :: Id }
+data State = State { getRealRun :: Name, getRealRunId :: Id, getRun :: Name, getRunId :: Id, getTree :: TyCon, getBuffer :: TyCon, getError :: Id }
 
 transformProgram :: ModGuts -> CoreM ModGuts
 transformProgram guts = do
@@ -44,8 +46,9 @@ transformProgram guts = do
   tyCon' <- lookupTyCon name''
   id <- lookupId name'''
   runId <- lookupId name
+  realRunId <- lookupId realRun
   putMsgS (showSDocUnsafe $ ppr name)
-  newBinds <- mapM (transformFunc (State { getRealRun = realRun, getRun = name, getRunId = runId, getTree = tyCon, getBuffer = tyCon', getError = id }) guts) (mg_binds guts)
+  newBinds <- mapM (transformFunc (State { getRealRun = realRun, getRealRunId = realRunId, getRun = name, getRunId = runId, getTree = tyCon, getBuffer = tyCon', getError = id }) guts) (mg_binds guts)
   return $ guts { mg_binds = newBinds }
 
 transformFunc :: State -> ModGuts -> CoreBind -> CoreM CoreBind
@@ -88,10 +91,10 @@ convert st e@(App (App (App cons (Type ty)) e1) e2)
 convert st e = Nothing
   --error "here"
 
-data RunExpr = RunExpr [Var] [CoreExpr] VarSet
+data RunExpr = RunExpr Var CoreExpr VarSet
 type Info = [RunExpr]
 
-notPresent x (RunExpr _ _ varSet) = not $ x `elemVarSet` varSet
+present xs (RunExpr _ _ varSet) = any (`elemVarSet` varSet) xs
 
 getType :: State -> CoreExpr
 getType st = Type $ mkTyConApp (getTree st) [mkTyConApp (getBuffer st) []]
@@ -118,7 +121,7 @@ names' st (x:xs) = do
 
 getAll :: Info -> ([Var], [CoreExpr])
 getAll [] = ([], [])
-getAll (RunExpr ns ls _:xs) = (ns ++ ns', ls ++ ls')
+getAll (RunExpr ns ls _:xs) = (ns:ns', ls:ls')
   where (ns', ls') = getAll xs
 
 createDown :: State -> Type -> [Var] -> CoreExpr -> CoreExpr -> CoreM CoreExpr
@@ -151,15 +154,18 @@ transformBind st (Rec bs) = Rec <$> (mapM (\(b, e) -> (b,) <$> transformExpr' st
 transformExpr' :: State -> CoreExpr -> CoreM CoreExpr
 transformExpr' st e = do
   (e', info) <- transformExpr st e
-  case info of
-    [] -> return e'
-    _ -> make st info e'
+  force st info e'
+
+force :: State -> Info -> CoreExpr -> CoreM CoreExpr
+force _ [] expr = return expr
+force st [RunExpr x e varSet] expr = return $ Let (NonRec x (App (Var (getRealRunId st)) e)) expr
+force st info expr = make st info expr
 
 transformExpr :: State -> CoreExpr -> CoreM (CoreExpr, Info)
 
 transformExpr st e@(App e1 e2)
   | matchesRun st e1 = do
-        {-case convert st e2 of
+        {- case convert st e2 of
             Nothing -> do
                 putMsgS "fail"
                 return (e, [])
@@ -168,36 +174,63 @@ transformExpr st e@(App e1 e2)
         putMsgS "success"
         var2 <- mkSysLocalM (fsLit "hashan2") (getType'' st)
         --run <- createRun st (map Var names)
-        return (Var var2, [RunExpr [var2] [e2] (exprFreeVars e2)])
+        return (Var var2, [RunExpr var2 e2 (exprFreeVars e2)])
   | otherwise = do
         (e1', info1) <- transformExpr st e1
         (e2', info2) <- transformExpr st e2
         let e' = App e1' e2'
         {-when ((not (null info1)) && (not (null info2))) do
           putMsgS "join"-}
-        if ((not (null info1)) && (not (null info2)))
+        {-if ((not (null info1)) && (not (null info2)))
           then do
             ee <- make st (info1 ++ info2) e'
             return (ee, [])
-          else return (e', info1 ++ info2)
+          else return (e', info1 ++ info2)-}
+        return (e', info1 ++ info2)
 
 transformExpr st e@(Lam x e1) = do
   (e1', info) <- transformExpr st e1
-  let e' = Lam x e1'
-  let info' = filter (notPresent x) info
-  when (length info /= length info') do
-    putMsgS "stop"
-  return (e', info')
+  --let info' = filter (notPresent x) info
+  {-if (length info /= length info')
+    then do -}
+  e1'' <- force st info e1'
+  return $ (Lam x e1'', [])
+    {-else
+      return (Lam x e', info')-}
 
-{-transformExpr st e@(Let (NonRec x e1) e2) = do
+transformExpr st e@(Let (NonRec x e1) e2) = do
+  --(e1', info1) <- transformExpr st e1
+  putMsgS "let"
   (e1', info1) <- transformExpr st e1
   (e2', info2) <- transformExpr st e2
-  let e' = Let (NonRec x e1') e2'
-  let info1' = info1
-  let info2' = filter (notPresent x) info2
-  return (e', info1' ++ info2')-}
+  if not (null (filter (present [x]) info2))
+    then do
+      e2'' <- force st info2 e2'
+      return (Let (NonRec x e1') e2'', info1)
+    else
+      return (Let (NonRec x e1') e2', info1 ++ info2)
+  
+transformExpr st (Case e1 b t as) = do
+  (e1', info1) <- transformExpr st e1
+  (as', info2) <- transformAlts st as
+  return (Case e1' b t as', info1 ++ info2)
 
 transformExpr st e = return (e, [])
+
+transformAlts st [(f, h, g)] = do
+  putMsgS "caseOne"
+  (g', info) <- transformExpr st g
+  if not (null (filter (present h) info))
+    then do
+      g'' <- force st info g'
+      return ([(f, h, g'')], [])
+    else
+      return ([(f, h, g')], info)
+
+transformAlts st as = do
+  putMsgS "case"
+  as' <- mapM (\(a, b, c) -> ((a,b,) <$> transformExpr' st c)) as
+  return $ (as', [])
 
 {-transformExpr :: State -> CoreExpr -> CoreM CoreExpr
 -- See 'Id'/'Var' in 'compiler/basicTypes/Var.lhs' (note: it's opaque)
@@ -223,5 +256,15 @@ transformExpr _ e@(Coercion c) = return e-}
 install :: [CommandLineOption] -> [CoreToDo] -> CoreM [CoreToDo]
 install _ todo = do
   putMsgS "Hello!"
+  dflags <- getDynFlags
+  let simplPass = SimplMode 
+                    { sm_phase      = Phase 0
+                    , sm_names      = []
+                    , sm_dflags     = dflags
+                    , sm_rules      = False
+                    , sm_eta_expand = True
+                    , sm_inline     = True
+                    , sm_case_case  = True
+                    }
   let pass = CoreDoPluginPass "Template" transformProgram
-  return $ todo ++ [pass]
+  return $ todo ++ [pass, CoreDoSimplify 3 simplPass]
