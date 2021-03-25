@@ -1,8 +1,10 @@
-{-# LANGUAGE ForeignFunctionInterface, BangPatterns, TypeApplications, DeriveLift, FlexibleInstances, TemplateHaskell, BlockArguments #-}
+{-# LANGUAGE ForeignFunctionInterface, TypeFamilies, UndecidableInstances, AllowAmbiguousTypes, TypeFamilyDependencies, DeriveFunctor, ScopedTypeVariables, GADTs, StandaloneDeriving, StandaloneKindSignatures, DataKinds, BangPatterns, TypeApplications, DeriveLift, FlexibleInstances, TemplateHaskell, BlockArguments #-}
 module Lib where
 
+-- AllowAmbiguousTypes
+
 import Language.Haskell.TH.Lib
-import Language.Haskell.TH.Syntax
+import Language.Haskell.TH.Syntax hiding (Type)
 import Prelude hiding (sum)
 import Foreign.C.String
 import Foreign.C
@@ -17,6 +19,7 @@ import Foreign.ForeignPtr.Unsafe
 import Data.List (intercalate)
 import Control.Monad.State.Lazy
 import Control.Monad (when)
+import Data.Kind (Type)
 
 -- #include "tensorflow/compiler/xla/hashan/c_api.h"
 
@@ -78,45 +81,52 @@ data CompOp
   | NE
   deriving (Show, Lift, Eq)
 
-data Tree a
+data TreePrim a
   = Constant Float
   | Identity Int
-  | Parameter a
-  | BinEval BinOp (Tree a) (Tree a)
-  | UnaryEval UnaryOp (Tree a)
-  deriving (Lift)
+  -- | Parameter a
+  | BinEval BinOp a a
+  | UnaryEval UnaryOp a
+  deriving (Functor, Lift)
+
+data Free f a
+  = Pure a
+  | Impure (f (Free f a))
+  deriving (Functor)
+
+type Tree a = Free TreePrim a
+-- deriving instance Lift (Tree )
 
 instance Num Buffer where
-  a + b = run (binEval Add (Parameter a) (Parameter b))
-  a - b = run (binEval Subtract (Parameter a) (Parameter b))
-  a * b = run (binEval Multiply (Parameter a) (Parameter b))
-  negate a = run (unaryEval Negate (Parameter a))
-  abs a = run (unaryEval Abs (Parameter a))
-  signum a = run (unaryEval Sign (Parameter a))                           
+  a + b = run (binEval Add (Pure a) (Pure b))
+  a - b = run (binEval Subtract (Pure a) (Pure b))
+  a * b = run (binEval Multiply (Pure a) (Pure b))
+  negate a = run (unaryEval Negate (Pure a))
+  abs a = run (unaryEval Abs (Pure a))
+  signum a = run (unaryEval Sign (Pure a))                           
   fromInteger = Const . fromIntegral -- Constant (fromIntegral a)
   {-# INLINE (*) #-}
   {-# INLINE (-) #-}
   {-# INLINE negate #-}
   {-# INLINE (+) #-}
 
-a `eq` b = run (binEval (Compare Lib.EQ) (Parameter a) (Parameter b))
-
-a @@ b = run (binEval Dot (Parameter a) (Parameter b))
-gather a b = run (binEval Gather (Parameter a) (Parameter b))
-reshape a s = run (unaryEval (Reshape s) (Parameter a))
+a `eq` b = run (binEval (Compare Lib.EQ) (Pure a) (Pure b))
+a @@ b = run (binEval Dot (Pure a) (Pure b))
+gather a b = run (binEval Gather (Pure a) (Pure b))
+reshape a s = run (unaryEval (Reshape s) (Pure a))
 
 instance Fractional Buffer where
-  a / b = run (binEval Divide (Parameter a) (Parameter b))
+  a / b = run (binEval Divide (Pure a) (Pure b))
   fromRational a = undefined
   {-# INLINE (/) #-}
 
 instance Floating Buffer where
   pi = undefined
-  exp a = run (unaryEval Exponential (Parameter a))
-  log a = run (unaryEval Log (Parameter a))
-  sin a = run (unaryEval Sine (Parameter a))
-  cos a = run (unaryEval Cosine (Parameter a))
-  tanh a = run (unaryEval Tanh (Parameter a))
+  exp a = run (unaryEval Exponential (Pure a))
+  log a = run (unaryEval Log (Pure a))
+  sin a = run (unaryEval Sine (Pure a))
+  cos a = run (unaryEval Cosine (Pure a))
+  tanh a = run (unaryEval Tanh (Pure a))
   sinh = undefined
   cosh = undefined
   asinh = undefined
@@ -130,22 +140,22 @@ getSize :: Buffer -> Size
 getSize (Device a b) = b
 
 change :: Tree Buffer -> State Int (TreeRaw, [Buffer])
-change (Parameter (Const f)) = return (Constant f, [])
-change (Parameter a@(Device _ size)) = do
+change (Pure (Const f)) = return (Impure (Constant f), [])
+change (Pure a@(Device _ size)) = do
   st <- get
   put (st + 1)
-  return (Parameter (st, size), [a])
-change (BinEval binOp treeA treeB) = do
+  return (Pure (st, size), [a])
+change (Impure (BinEval binOp treeA treeB)) = do
   (treeA', result) <- change treeA
   (treeB', result') <- change treeB
-  return (BinEval binOp treeA' treeB', result ++ result')
-change (UnaryEval unOp tree) = do 
+  return (binEval binOp treeA' treeB', result ++ result')
+change (Impure (UnaryEval unOp tree)) = do 
   (tree', result) <- change tree
-  return (UnaryEval unOp tree', result)
-change (Constant f) = do
-  return (Constant f, [])
-change (Identity n) = do
-  return (Identity n, [])
+  return (unaryEval unOp tree', result)
+change (Impure (Constant f)) = do
+  return (Impure (Constant f), [])
+change (Impure (Identity n)) = do
+  return (Impure (Identity n), [])
 
 runHelper :: [Tree Buffer] -> State Int ([TreeRaw], [Buffer])
 runHelper [] = return ([], [])
@@ -225,15 +235,21 @@ binary =
   ]
 
 len :: Buffer -> Int
-len (Device _ (Dim1 m)) = m
+len (Device _ size) = len' size
+
+len' (Dim1 m) = m
 
 rows :: Buffer -> Int
-rows (Device _ (Dim2 m _)) = m
-rows (Device _ (Dim2R m _)) = m
+rows (Device _ size) = rows' size
+
+rows' (Dim2 m _) = m
+rows' (Dim2R m _) = m
 
 cols :: Buffer -> Int
-cols (Device _ (Dim2 _ n)) = n
-cols (Device _ (Dim2R _ n)) = n
+cols (Device _ size) = cols' size
+
+cols' (Dim2 _ n) = n
+cols' (Dim2R _ n) = n
 
 shouldNotBeReachable :: a
 shouldNotBeReachable = error "should not be reachable"
@@ -269,11 +285,51 @@ compat' _ _ = False
 
 compat m n = compat' (norm m) (norm n)
 
+findSize :: Tree Buffer -> Size
+findSize (Pure a) = getSize a
+findSize (Impure a) = findSize' $ fmap findSize a
+
+findSize' :: TreePrim Size -> Size
+findSize' (Constant _) = Dim0
+findSize' (Identity n) = Dim2 n n
+findSize' (UnaryEval (Broadcast s) _) = s
+findSize' (UnaryEval (Reshape s) _) = s
+findSize' (UnaryEval Transpose size) = 
+  case size of
+    Dim2 a b -> Dim2R b a
+    Dim2R a b -> Dim2 b a
+    _ -> error "Size Mismatch"
+findSize' (UnaryEval ReduceArgMax size) = 
+  case norm size of 
+    Dim2 rows cols -> Dim1 rows
+    _ -> error "Size Mismatch"
+findSize' (UnaryEval op a) = a
+findSize' (BinEval Gather a b) =
+  case (a, b) of
+    (Dim2 m 1, Dim2 _ n) -> Dim2 m n
+    _ -> error "Size Mismatch"
+findSize' (BinEval Dot a b) = a `compat` b
+  where compat m n = compat' (norm m) (norm n)
+        compat' (Dim2 m1 m2) (Dim2 n1 n2)
+          | m2 == n1 = Dim2 m1 n2
+        compat' (Dim1 m) (Dim1 n)
+          | m == n = Dim0
+        compat' m n = error $ "Size Mismatch, " ++ show m ++ ", " ++ show n
+findSize' (BinEval ReduceAdd a b)
+  | b == Dim0 = case norm a of
+                  Dim1 m -> Dim0
+                  Dim2 m n -> Dim1 m
+                  _ -> error "Size Mismatch"
+  | otherwise = error "Size Mismatch"
+findSize' (BinEval op a b)
+  | a `compat` b = a
+  | otherwise = error "Size Mismatch"
+
 eval :: TreeRaw -> State Int ([String], String, Size)
-eval (Parameter (i, size)) = 
+eval (Pure (i, size)) = 
   complete size "parameter" [] [show i] []
 
-eval (UnaryEval (Broadcast size) tree) = do
+eval (Impure (UnaryEval (Broadcast size) tree)) = do
   (result, loc, size') <- eval tree
   let args = compat size' size
   complete size "broadcast" result [loc] args
@@ -285,14 +341,12 @@ eval (UnaryEval (Broadcast size) tree) = do
           | m == n1 = [("dimensions", "{0}")]
         compat m n = error $ "Size Mismatch " ++ show m ++ ", " ++ show n
 
-eval (UnaryEval Transpose tree) = do
+eval (Impure (UnaryEval Transpose tree)) = do
   (result, loc, size) <- eval tree
-  let size' = case size of
-                Dim2 a b -> Dim2R b a
-                Dim2R a b -> Dim2 b a
-  complete size' "transpose" result [loc] [("dimensions", "{1,0}")]
+  let outputSize = findSize' (UnaryEval Transpose size) 
+  complete outputSize "transpose" result [loc] [("dimensions", "{1,0}")]
 
-eval (UnaryEval ReduceArgMax tree) = do
+eval (Impure (UnaryEval ReduceArgMax tree)) = do
   (result, loc, size) <- eval tree
   let Dim2 rows cols = norm size
   st <- get
@@ -305,81 +359,62 @@ eval (UnaryEval ReduceArgMax tree) = do
   put (st + 4)
   complete (Dim1 rows) "get-tuple-element" (result ++ [op1, op2, op3, op4]) ["reduce." ++ show (st + 3)] [("index", "1")]
 
-eval (UnaryEval op tree) = do
+eval (Impure (UnaryEval op tree)) = do
   (result, loc, size) <- eval tree
   let opStr = unary op
-  let size' = case op of
-                Reshape s -> s
-                _ -> size
-  complete size' opStr result [loc] []
+  let outputSize = findSize' (UnaryEval op size)
+  complete outputSize opStr result [loc] []
 
-eval (BinEval (Compare op) treeA treeB) = do
+eval (Impure (BinEval (Compare op) treeA treeB)) = do
   (result, loc, size) <- eval treeA
   (result', loc', size') <- eval treeB
-  if size `compat` size'
-    then do
-      st <- get
-      let compare = "  compare." ++ show st ++ " = " ++ showSize' "pred" size ++ " compare(" ++ loc ++ ", " ++ loc' ++ "), direction=" ++ show op 
-      put (st + 1)
-      complete size "convert" (result ++ result' ++ [compare]) ["compare." ++ show st] []
-    else error "Size Mismatch"
+  let outputSize = findSize' (BinEval (Compare op) size size')
+  st <- get
+  let compare = "  compare." ++ show st ++ " = " ++ showSize' "pred" outputSize ++ " compare(" ++ loc ++ ", " ++ loc' ++ "), direction=" ++ show op 
+  put (st + 1)
+  complete outputSize "convert" (result ++ result' ++ [compare]) ["compare." ++ show st] []
 
-eval (BinEval Dot treeA treeB) = do
+eval (Impure (BinEval Dot treeA treeB)) = do
   (result, loc, size) <- eval treeA
   (result', loc', size') <- eval treeB
-  let outputSize = compat size size'
+  let outputSize = findSize' (BinEval Dot size size')
   let args = case outputSize of
                Dim0 -> [("lhs_contracting_dims", "{0}"), ("rhs_contracting_dims", "{0}")]
                Dim2 _ _ -> [("lhs_contracting_dims", "{1}"), ("rhs_contracting_dims", "{0}")]
   complete outputSize "dot" (result ++ result') [loc, loc'] args
-  where compat m n = compat' (norm m) (norm n)
-        compat' (Dim2 m1 m2) (Dim2 n1 n2)
-          | m2 == n1 = Dim2 m1 n2
-        compat' (Dim1 m) (Dim1 n)
-          | m == n = Dim0
-        compat' m n = error $ "Size Mismatch, " ++ show m ++ ", " ++ show n
 
-eval (BinEval Gather treeA treeB) = do
+eval (Impure (BinEval Gather treeA treeB)) = do
   (result, loc, size) <- eval treeA
   (result', loc', size') <- eval treeB
-  let outputRows = case size' of
-            Dim2 m 1 -> m
-            _ -> error "Size Mismatch"
-  let outputCols = case size of
-            Dim2 m n -> n
-            _ -> error "Size Mismatch"
+  let outputSize@(Dim2 rows cols) = findSize' (BinEval Gather size' size)
   st <- get
-  let convert = "  convert." ++ show st ++ " = s32[" ++ show outputRows ++ ",1]{1,0} convert(" ++ loc' ++ ")" 
+  let convert = "  convert." ++ show st ++ " = s32[" ++ show rows ++ ",1]{1,0} convert(" ++ loc' ++ ")" 
   put (st + 1)
-  complete (Dim2 outputRows outputCols) "gather" (result ++ result' ++ [convert]) [loc, "convert." ++ show st] 
+  complete outputSize "gather" (result ++ result' ++ [convert]) [loc, "convert." ++ show st] 
     [("offset_dims", "{1}"), ("collapsed_slice_dims", "{0}"), ("start_index_map","{0}"),
-      ("index_vector_dim", "1"), ("slice_sizes", "{1," ++ show outputCols ++ "}")]
+      ("index_vector_dim", "1"), ("slice_sizes", "{1," ++ show cols ++ "}")]
 
-eval (BinEval ReduceAdd treeA treeB) = do
+eval (Impure (BinEval ReduceAdd treeA treeB)) = do
   (result, loc, size) <- eval treeA
   (result', loc', size') <- eval treeB
-  when (size' /= Dim0) (error "Size Mismatch")
-  let outputSize = case norm size of
-                     Dim1 m -> Dim0
-                     Dim2 m n -> Dim1 m
-                     _ -> error "Size Mismatch"
+  let outputSize = findSize' (BinEval ReduceAdd size size')
   let dims = case outputSize of
                Dim1 _ -> "{1}"
                Dim0 -> "{0}"
   complete outputSize "reduce" (result ++ result') [loc, loc'] [("dimensions", dims), ("to_apply", "primitive_computation_add.0")]
 
-eval (BinEval op treeA treeB) = do
+eval (Impure (BinEval op treeA treeB)) = do
   (result, loc, size) <- eval treeA
   (result', loc', size') <- eval treeB
+  let outputSize = findSize' (BinEval op size size')
   let opStr = fromJust $ lookup op binary
-  if size `compat` size'
-    then complete size opStr (result ++ result') [loc, loc'] []
-    else error $ "Size Mismatch " ++ opStr ++ " " ++ show size ++ " " ++ show size'
+  complete outputSize opStr (result ++ result') [loc, loc'] []
 
-eval (Constant f) = do
-  complete Dim0 "constant" [] [show f] []
+eval (Impure (Constant f)) = do
+  let outputSize = findSize' (Constant f)
+  complete outputSize "constant" [] [show f] []
 
-eval (Identity n) = do
+eval (Impure (Identity n)) = do
   st <- get 
   let size = show n ++ "," ++ show n
   let op1 = "  iota." ++ show st ++ " = s32[" ++ size ++ "] iota(), iota_dimension=0"
@@ -411,14 +446,17 @@ create1D list = unsafePerformIO do
 let (_, ptr) = toForeignPtr arr in
 {# call pure XLA_CreateBuffer2D as ^ #} (unsafeCoerce ptr) (fromIntegral m) (fromIntegral n) -}
 
-binEval = BinEval
-unaryEval = UnaryEval
+binEval a b c = Impure $ BinEval a b c
+unaryEval a b = Impure $ UnaryEval a b
 
 {-# INLINE[1] binEval #-}
 {-# INLINE[1] unaryEval #-}
---{-# INLINE[1] run #-}
---{-# NOINLINE runInner #-}
+--{-# INLINE CONLIKE[1] run #-}
+-- {-# NOINLINE runInner #-}
 {-# NOINLINE run #-}
+{-# NOINLINE rows #-}
+{-# NOINLINE cols #-}
+{-# NOINLINE len #-}
 {-# INLINE square #-}
 {-# INLINE (@@) #-}
 {-# INLINE reshape #-}
@@ -435,11 +473,24 @@ unaryEval = UnaryEval
 -- {-# INLINE CONLIKE [1] run #-}
 
 {-# RULES "hashan/binEvalRight" forall x y z.
-      binEval x y (Parameter (run z)) = binEval x y z ; #-}
+      binEval x y (Pure (run z)) = binEval x y z ; #-}
 {-# RULES "hashan/binEvalLeft" forall x y z.
-      binEval x (Parameter (run y)) z = binEval x y z ; #-}
+      binEval x (Pure (run y)) z = binEval x y z ; #-}
 {-# RULES "hashan/unaryEval" forall x y.
-      unaryEval x (Parameter (run y)) = unaryEval x y ; #-}
+      unaryEval x (Pure (run y)) = unaryEval x y ; #-}
+{-# RULES "hashan/rows" forall x.
+      rows (run x) = rows' (findSize x) ; #-}
+{-# RULES "hashan/cols" forall x.
+      cols (run x) = cols' (findSize x) ; #-}
+{-# RULES "hashan/len" forall x.
+      len (run x) = len' (findSize x) ; #-}
+
+{-- {-# RULES "hashan/binEvalRight" forall x y z.
+      run (BinEval x y (Parameter (run z))) = run (BinEval x y z) ; #-}
+{-# RULES "hashan/binEvalLeft" forall x y z.
+      run (BinEval x (Parameter (run y)) z) = run (BinEval x y z) ; #-}
+{-# RULES "hashan/unaryEval" forall x y.
+      run (UnaryEval x (Parameter (run y))) = run (UnaryEval x y) ; #-} --}
 
 power ::  (Num a) => Int -> TExpQ (a -> a)
 power 0 = [|| const 1 ||]
@@ -455,36 +506,49 @@ initialise = xlaInit
 c = Const . fromIntegral
 c' = Const
 
+compute :: (Pass n, VecHelpers n) => Vec n Layer -> Code (Vec n (Tensor, Tensor) -> Tensor -> Tensor -> (Vec n (Tensor, Tensor), Tensor))
 compute layers
   = [|| \weights targets input -> 
       let activations = $$(forwardPass layers) weights input in
-      let preds = softmax (last activations) in
+      let preds = softmax (last' activations) in
       let !loss = negate (mean (sum (log preds * targets))) in
       let delta = (preds - targets) / (broadcast' (rows input, 10) (c (rows input))) in
-      let !backward = $$(backwardPass (reverse layers)) (reverse weights) (reverse activations) delta in
+      let !backward = $$(backwardPass (reverse' layers)) (reverse' weights) (reverse' activations) delta in
       (backward, loss)
     ||]
 
-forwardPass :: [Layer] -> Code ([(Tensor, Tensor)] -> Tensor -> [Tensor])
-forwardPass [] = [|| \[] x -> [x] ||]
-forwardPass ((l1, l2):ls) 
-  = [|| \((x1, x2):xs) y ->
-      let tmp = $$l1 (x1, x2, y) in
-      y : $$(forwardPass ls) xs tmp
-    ||]
+class Pass n where
+  forwardPass :: Vec n Layer -> Code (Vec n (Tensor, Tensor) -> Tensor -> Vec (S n) Tensor)
+  backwardPass :: Vec n Layer -> Code (Vec n (Tensor, Tensor) -> Vec (S n) Tensor -> Tensor -> Vec n (Tensor, Tensor))
 
-backwardPass :: [Layer] -> Code ([(Tensor, Tensor)] -> [Tensor] -> Tensor -> [(Tensor, Tensor)])
-backwardPass [] = [|| \[] [_] _ -> []||]
-backwardPass ((l1, l2):ls)
-  = [|| \((x1, x2):xs) (i1:i2:is) delta ->
-        let (!a, !b, !c) = $$l2 (x1, x2, i2) i1 delta in
-        (a, b) : $$(backwardPass ls) xs (i2:is) c
-    ||]
+instance Pass Z where
+  forwardPass (End (l1, l2)) 
+    = [|| \(End (x1, x2)) y -> 
+          let tmp = $$l1 (x1, x2, y) in
+          y `cons` nil tmp
+      ||]
+  backwardPass (End (l1, l2)) 
+    = [|| \(End (x1, x2)) (i1, End i2) delta -> 
+          let (!a, !b, !c) = $$l2 (x1, x2, i2) i1 delta in
+          nil (a, b)
+      ||]
 
-layers = [linearTanh, linearTanh, linear]
+instance Pass n => Pass (S n) where
+  forwardPass ((l1, l2), ls) 
+    = [|| \((x1, x2), xs) y ->
+        let tmp = $$l1 (x1, x2, y) in
+        y `cons` $$(forwardPass ls) xs tmp
+      ||]
+  backwardPass ((l1, l2), ls)
+    = [|| \((x1, x2), xs) (i1, (i2, is)) delta ->
+          let (!a, !b, !c) = $$l2 (x1, x2, i2) i1 delta in
+          (a, b) `cons` $$(backwardPass ls) xs (i2 `cons` is) c
+      ||]
 
-transpose a = run (unaryEval Transpose (Parameter a))
-reduceArgMax a = run (unaryEval ReduceArgMax (Parameter a))
+layers = linearTanh `cons` (linearTanh `cons` (nil linear))
+
+transpose a = run (unaryEval Transpose (Pure a))
+reduceArgMax a = run (unaryEval ReduceArgMax (Pure a))
 
 linearTanh :: Layer
 linearTanh = (
@@ -497,10 +561,10 @@ linearTanh = (
         (deltaW, reshape deltaB (Dim1 (cols deltaB)), deltaX) ||]
   )
 
-identity n = run (Identity n)
+identity n = run (Impure (Identity n))
 square x = x * x
-broadcast s =  run . unaryEval (Broadcast (Dim1 s)) . Parameter
-broadcast' (m, n) =  run . unaryEval (Broadcast (Dim2 m n)) . Parameter
+broadcast s =  run . unaryEval (Broadcast (Dim1 s)) . Pure
+broadcast' (m, n) =  run . unaryEval (Broadcast (Dim2 m n)) . Pure
 
 linear :: Layer
 linear = (
@@ -512,6 +576,77 @@ linear = (
         (deltaW, reshape deltaB (Dim1 (cols deltaB)), deltaX) ||]
   )
 
-sum x = run (binEval ReduceAdd (Parameter x) (Parameter 0))
+sum x = run (binEval ReduceAdd (Pure x) (Pure 0))
 mean x = sum x / c (len x)
 softmax x = exp x / (broadcast' (rows x, cols x) (sum (exp x)))
+
+data Nat = Z | S Nat
+
+--infixr 5 :-
+
+cons :: t -> Vec n t -> Vec (S n) t
+cons a b = (a, b)
+
+nil :: t -> Vec Z t
+nil x = End x
+
+newtype End a = End a
+
+type Vec :: Nat -> Type -> Type
+type family Vec n a = result | result -> a n where
+  Vec Z     a = End a
+  Vec (S n) a = (a, Vec n a)
+
+class VecHelpers n where
+  mapM' :: (Monad m) => (t1 -> m t2) -> Vec n t1 -> m (Vec n t2)
+  zipWith' :: (t1 -> t2 -> t3) -> Vec n t1 -> Vec n t2 -> Vec n t3
+  snoc' :: Vec n t -> t -> Vec (S n) t
+  reverse' :: Vec n t -> Vec n t
+  length' :: Vec n t -> Int
+  last' :: Vec n t -> t
+
+instance VecHelpers Z where
+  mapM' f (End a) = End <$> f a
+  zipWith' f (End a) (End b) = nil (f a b)
+  snoc' (End a) x = a `cons` nil x
+  reverse' (End a) = nil a
+  length' (End a) = 1
+  last' (End a) = a
+
+instance VecHelpers n => VecHelpers (S n) where
+  mapM' f (a, b) = liftM2 cons (f a) (mapM' f b)
+  zipWith' f (a1, b1) (a2, b2) = f a1 a2 `cons` zipWith' f b1 b2
+  snoc' (x, y) z = x `cons` snoc' y z
+  reverse' (x, y) = snoc' (reverse' y) x
+  length' (x, y) = 1 + length' y
+  last' (x, y) = last' y
+
+{-type Vec :: Nat -> Type -> Type
+data Vec t n where
+  Nil :: Vec Z t
+  (:-) :: !t -> !(Vec n t) -> Vec (S n) t-}
+
+{-mapM' :: (Monad m) => (t1 -> m t2) -> Vec n t1 -> m (Vec n t2)
+mapM' f Nil = return Nil
+mapM' f (a :- b) = liftM2 (:-) (f a) (mapM' f b)
+
+zipWith' :: (t1 -> t2 -> t3) -> Vec n t1 -> Vec n t2 -> Vec n t3
+zipWith' f Nil Nil = Nil
+zipWith' f (a1 :- b1) (a2 :- b2) = f a1 a2 :- zipWith' f b1 b2
+
+snoc' :: Vec n t -> t -> Vec (S n) t
+snoc' Nil x = x :- Nil
+snoc' (x :- y) z = x :- snoc' y z
+
+reverse' :: Vec n t -> Vec n t
+reverse' Nil = Nil
+reverse' (x :- y) = snoc' (reverse' y) x
+
+last' :: Vec n t -> t
+last' (x :- Nil) = x
+last' (x :- y) = last' y
+
+length' :: Vec n t -> Int
+length' Nil = 0
+length' (x :- y) = 1 + length' y-}
+

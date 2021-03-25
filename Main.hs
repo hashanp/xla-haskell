@@ -1,5 +1,5 @@
-{-# OPTIONS_GHC -fplugin=Plugin #-}
-{-# LANGUAGE TypeApplications, FlexibleInstances, BangPatterns, TemplateHaskell, BlockArguments #-}
+--{-# OPTIONS_GHC -fplugin=Plugin #-}
+{-# LANGUAGE TypeApplications, FlexibleInstances, BangPatterns, DataKinds, GADTs, TemplateHaskell, BlockArguments #-}
 module Main where
 
 import Prelude hiding (sin, sum)
@@ -23,7 +23,7 @@ import GHC.Arr
 import Data.Random.Normal
 
 -- pure function
---foreign import ccall "hashan" c_sin :: CDouble -> CDouble
+-- foreign import ccall "hashan" c_sin :: CDouble -> CDouble
 --sin :: Double -> Double
 --sin d = realToFrac (c_sin (realToFrac d))
 
@@ -110,7 +110,9 @@ get (m, n) = do
   biases <- makeR' n 0.1
   return (weights, biases)
 
-doBatch :: [(Tensor, Tensor)] -> Tensor -> Tensor -> [[Float]] -> Int -> IO [(Tensor, Tensor)]
+type Two = S (S Z)
+
+doBatch :: Vec Two (Tensor, Tensor) -> Tensor -> Tensor -> [[Float]] -> Int -> IO (Vec Two (Tensor, Tensor))
 doBatch weights _ _ [] _ = return weights
 doBatch weights x y (b:bs) n = do
   print $ "iteration " ++ show n
@@ -123,7 +125,7 @@ doBatch weights x y (b:bs) n = do
   printView loss
   when (n `mod` 50 == 0) do
     performMajorGC
-  doBatch (zipWith (update stepSize) weights (reverse p)) x y bs (n + 1)
+  doBatch (zipWith' (update stepSize) weights (reverse' p)) x y bs (n + 1)
 
 main = do
   initialise
@@ -132,9 +134,9 @@ main = do
   let other = make' [0..9]
   let y = create1D (map fromIntegral (V.toList labels))
   let x = create2D (60000, 28 * 28) (map fromIntegral (V.toList (idxIntContent images)))
-  initial <- mapM get [ (784, 1024)
-                      , (1024, 1024)
-                      , (1024, 10)]
+  initial <- mapM' get ( (784, 1024) `cons`
+                        ((1024, 1024) `cons`
+                        nil (1024, 10)))
   batch <- chunksOf batchSize <$> shuffle [0..59999]
   {-let p = $$(forwardPass layers) initial x'
   print $ head batch
@@ -147,12 +149,12 @@ main = do
   --let res2 = eq (reshape res (Dim2 128 1)) y'-}
   p <- doBatch initial x y (take 200 batch) 0
   let res = $$(forwardPass layers) p x
-  let res' = eq y (reduceArgMax (softmax (last res)))
+  let res' = eq y (reduceArgMax (softmax (last' res)))
   let res'' = mean res'
   --printView (gather (fst $ p !! 1) (reshape other (Dim2 10 1)))
   --printView (snd $ last p'')
   --print $ (take 50 batch)
-  print $ length p
+  print $ length' p
   printView res'' --(mean (reshape res2 (Dim1 128)))
 
 {-print $ idxDimensions images
