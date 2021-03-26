@@ -1,4 +1,4 @@
-{-# LANGUAGE ForeignFunctionInterface, TypeFamilies, UndecidableInstances, AllowAmbiguousTypes, TypeFamilyDependencies, DeriveFunctor, ScopedTypeVariables, GADTs, StandaloneDeriving, StandaloneKindSignatures, DataKinds, BangPatterns, TypeApplications, DeriveLift, FlexibleInstances, TemplateHaskell, BlockArguments #-}
+{-# LANGUAGE ForeignFunctionInterface, LambdaCase, TypeFamilies, UndecidableInstances, AllowAmbiguousTypes, TypeFamilyDependencies, DeriveFunctor, ScopedTypeVariables, GADTs, StandaloneDeriving, StandaloneKindSignatures, DataKinds, BangPatterns, TypeApplications, DeriveLift, FlexibleInstances, TemplateHaskell, BlockArguments #-}
 module Lib where
 
 -- AllowAmbiguousTypes
@@ -36,12 +36,19 @@ foreign import ccall "XLA_Destructor" xlaRemove :: CInt -> FunPtr (Ptr BufferPri
 
 type Code a = TExpQ a
 type Size2D = (Int, Int)
-data Size = Dim2R Int Int | Dim2 Int Int | Dim1 Int | Dim0
-  deriving (Eq, Show, Lift)
+data SizePrim a = Dim2R a a | Dim2 a a | Dim1 a | Dim0
+  deriving (Eq, Show, Lift, Functor)
+type Size = SizePrim Int
+type SizeExtra = SizePrim TreeSize
 data Buffer = Device !(ForeignPtr BufferPrim) Size | Const Float
 type TreeRaw = Tree (Int, Size)
 type Tensor = Buffer
 type Layer = (Code ((Tensor, Tensor, Tensor) -> Tensor), Code ((Tensor, Tensor, Tensor) -> Tensor -> Tensor -> (Tensor, Tensor, Tensor)))
+
+makeIntoTreeSize :: Size -> SizeExtra
+makeIntoTreeSize = fmap Real
+extractFromTreeSize :: SizeExtra -> Size
+extractFromTreeSize = fmap (\case {Fake a -> a ; Real a -> a})
 
 data BinOp
   = Add
@@ -57,6 +64,11 @@ data BinOp
   | Compare CompOp
   deriving (Eq, Lift)
 
+data TreeSize 
+  = Real Int
+  | Fake Int
+  deriving (Eq, Lift)
+
 data UnaryOp
   = Sine
   | Cosine
@@ -68,8 +80,8 @@ data UnaryOp
   | Log
   | Transpose
   | ReduceArgMax
-  | Reshape Size
-  | Broadcast Size
+  | Reshape SizeExtra
+  | Broadcast SizeExtra
   deriving (Eq, Lift)
 
 data CompOp
@@ -87,6 +99,7 @@ data TreePrim a
   -- | Parameter a
   | BinEval BinOp a a
   | UnaryEval UnaryOp a
+  | CrossRef Int
   deriving (Functor, Lift)
 
 data Free f a
@@ -113,7 +126,7 @@ instance Num Buffer where
 a `eq` b = run (binEval (Compare Lib.EQ) (Pure a) (Pure b))
 a @@ b = run (binEval Dot (Pure a) (Pure b))
 gather a b = run (binEval Gather (Pure a) (Pure b))
-reshape a s = run (unaryEval (Reshape s) (Pure a))
+reshape a s = run (unaryEval (Reshape (makeIntoTreeSize s)) (Pure a))
 
 instance Fractional Buffer where
   a / b = run (binEval Divide (Pure a) (Pure b))
@@ -292,8 +305,8 @@ findSize (Impure a) = findSize' $ fmap findSize a
 findSize' :: TreePrim Size -> Size
 findSize' (Constant _) = Dim0
 findSize' (Identity n) = Dim2 n n
-findSize' (UnaryEval (Broadcast s) _) = s
-findSize' (UnaryEval (Reshape s) _) = s
+findSize' (UnaryEval (Broadcast s) _) = extractFromTreeSize s
+findSize' (UnaryEval (Reshape s) _) = extractFromTreeSize s
 findSize' (UnaryEval Transpose size) = 
   case size of
     Dim2 a b -> Dim2R b a
@@ -329,8 +342,9 @@ eval :: TreeRaw -> State Int ([String], String, Size)
 eval (Pure (i, size)) = 
   complete size "parameter" [] [show i] []
 
-eval (Impure (UnaryEval (Broadcast size) tree)) = do
+eval (Impure (UnaryEval (Broadcast size'') tree)) = do
   (result, loc, size') <- eval tree
+  let size = extractFromTreeSize size''
   let args = compat size' size
   complete size "broadcast" result [loc] args
   where compat Dim0 (Dim2R _ _) = error "Size Mismatch"
@@ -563,8 +577,8 @@ linearTanh = (
 
 identity n = run (Impure (Identity n))
 square x = x * x
-broadcast s =  run . unaryEval (Broadcast (Dim1 s)) . Pure
-broadcast' (m, n) =  run . unaryEval (Broadcast (Dim2 m n)) . Pure
+broadcast s =  run . unaryEval (Broadcast (makeIntoTreeSize (Dim1 s))) . Pure
+broadcast' (m, n) =  run . unaryEval (Broadcast (makeIntoTreeSize (Dim2 m n))) . Pure
 
 linear :: Layer
 linear = (
