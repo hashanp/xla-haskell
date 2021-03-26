@@ -8,16 +8,16 @@ import Finder (findImportedModule)
 import IfaceEnv (lookupOrigIO)
 import OccName hiding (varName, mkTcOcc) -- (mkVarOcc, mkDataOcc)
 import Data.Generics hiding (TyCon)
-import Control.Monad (when)
+import Control.Monad (when, (<=<))
 import TysWiredIn (consDataCon, consDataConName, nilDataConName, nilDataCon)
 import PrelNames (metaConsDataConName)
 import Name hiding (varName)
 import TyCon (mkPrelTyConRepName, TyCon)
 import CoreFVs (exprFreeVars)
-import VarSet (VarSet, elemVarSet)
+import VarSet (VarSet, elemVarSet, emptyVarSet, unionVarSets, unitVarSet)
 import Debug.Trace (trace)
-import HscTypes (lookupTyCon)
-import Type (mkTyConApp)
+import HscTypes (lookupTyCon, lookupDataCon)
+import Type (mkTyConApp, tyConAppTyCon, tyConAppArgs)
 import FastString (fsLit)
 import CoreUtils (exprType)
 import CoreMonad (SimplMode)
@@ -29,7 +29,61 @@ plugin = defaultPlugin
   , pluginRecompile = purePlugin
   }
 
-data State = State { getRealRun :: Name, getRealRunId :: Id, getRun :: Name, getRunId :: Id, getTree :: TyCon, getBuffer :: TyCon, getError :: Id }
+data State = State 
+  { getRealRun :: Name
+  , getRealRunId :: Id
+  , getRun :: Name
+  , getRunId :: Id
+  , getPure :: DataCon
+  , getImpure :: DataCon
+  , getTree :: TyCon
+  , getTreePrim :: TyCon
+  , getBuffer :: TyCon
+  , getError :: Id 
+  , getCols :: Id
+  , getRows :: Id
+  , getSize :: TyCon
+  , getUnary :: TyCon
+  }
+
+matcherT :: (State -> TyCon) -> (State -> CoreExpr -> Bool)
+matcherT f st (Type t)
+  | tyConAppTyCon_maybe t == Just (f st) && null (tyConAppArgs t) = True
+matcherT _ _ _ = False 
+
+isBase :: State -> CoreExpr -> Bool
+isBase st (App (App (Var e) t1) t2)
+  | e == dataConWorkId (getPure st) && matcherT getTreePrim st t1 && matcherT getBuffer st t2 = True
+isBase st (Var e)
+  | e == getCols st = True
+  | e == getRows st = True
+isBase _ _ = False
+
+within :: Var -> TyCon -> Bool
+e `within` ty = e `elem` map dataConWorkId (visibleDataCons (algTyConRhs ty))
+
+isSafe :: State -> CoreExpr -> Bool
+isSafe st (Var e) 
+  | e `within` getTreePrim st = True
+  | e `within` getSize st = True
+  | e `within` getUnary st = True
+  | e == dataConWorkId (getImpure st) = True
+isSafe st (App e1 e2) = isSafe st e1
+isSafe _ _ = False
+
+getPrincipalVars :: State -> CoreExpr -> VarSet
+getPrincipalVars st (App a (Var b)) 
+  | isBase st a = unitVarSet b
+getPrincipalVars st (App a b)
+  | isSafe st a = unionVarSets [getPrincipalVars st a, getPrincipalVars st b]
+getPrincipalVars _ _ = emptyVarSet
+
+getFreeVars :: State -> CoreExpr -> VarSet
+getFreeVars st (App a (Var b)) 
+  | isBase st a = emptyVarSet
+getFreeVars st (App a b)
+  | isSafe st a = unionVarSets [getFreeVars st a, getFreeVars st b]
+getFreeVars _ e = exprFreeVars e
 
 transformProgram :: ModGuts -> CoreM ModGuts
 transformProgram guts = do
@@ -37,18 +91,48 @@ transformProgram guts = do
   mod' <- liftIO $ findImportedModule hscEnv (mkModuleName "Lib") Nothing
   --mod'' <- liftIO $ findImportedModule hscEnv (mkModuleName "GHC.Types") Nothing
   let (Found _ mod) = mod'
-  realRun <- liftIO $ lookupOrigIO hscEnv mod (mkVarOcc "run")
-  name <- liftIO $ lookupOrigIO hscEnv mod (mkVarOcc "runInner")
-  name' <- liftIO $ lookupOrigIO hscEnv mod (mkTcOcc "Tree")
-  name'' <- liftIO $ lookupOrigIO hscEnv mod (mkTcOcc "Buffer")
-  name''' <- liftIO $ lookupOrigIO hscEnv mod (mkVarOcc "shouldNotBeReachable")
-  tyCon <- lookupTyCon name'
-  tyCon' <- lookupTyCon name''
-  id <- lookupId name'''
-  runId <- lookupId name
+  let getName = liftIO . lookupOrigIO hscEnv mod . mkVarOcc
+  let getTyCon = lookupTyCon <=< (liftIO . lookupOrigIO hscEnv mod . mkTcOcc)
+  let getDataCon = lookupDataCon <=< (liftIO . lookupOrigIO hscEnv mod . mkDataOcc)
+
+  realRun <- getName "run"
+  runInner <- getName "runInner"
+  shouldNotBeReachable <- getName "shouldNotBeReachable"
+
+  impure <- getDataCon "Impure"
+  pur <- getDataCon "Pure"
+
+  tree <- getTyCon "Tree"
+  buffer <- getTyCon "Buffer"
+  treePrim <- getTyCon "TreePrim"
+  size <- getTyCon "Size"
+  unary <- getTyCon "UnaryOp"
+
+  id <- lookupId shouldNotBeReachable
+  runId <- lookupId runInner
   realRunId <- lookupId realRun
-  putMsgS (showSDocUnsafe $ ppr name)
-  newBinds <- mapM (transformFunc (State { getRealRun = realRun, getRealRunId = realRunId, getRun = name, getRunId = runId, getTree = tyCon, getBuffer = tyCon', getError = id }) guts) (mg_binds guts)
+  cols <- lookupId =<< getName "cols"
+  rows <- lookupId =<< getName "rows"
+
+  let state = State
+                { getRealRun = realRun
+                , getRealRunId = realRunId
+                , getRun = runInner
+                , getRunId = runId
+                , getTree = tree
+                , getTreePrim = treePrim
+                , getBuffer = buffer
+                , getError = id
+                , getImpure = impure
+                , getPure = pur
+                , getCols = cols
+                , getRows = rows
+                , getSize = size
+                , getUnary = unary
+                }
+
+  --putMsgS (showSDocUnsafe $ ppr name)
+  newBinds <- mapM (transformFunc state guts) (mg_binds guts)
   return $ guts { mg_binds = newBinds }
 
 transformFunc :: State -> ModGuts -> CoreBind -> CoreM CoreBind
@@ -145,8 +229,6 @@ make st info e = do
 names :: Info -> [(CoreExpr, [Name])]
 names = mapM (\(RunExpr a b _) -> (a,) <$> )-}
 
-{--}
-
 transformBind :: State -> CoreBind -> CoreM CoreBind
 transformBind st (NonRec b e) = (NonRec b) <$> (transformExpr' st e)
 transformBind st (Rec bs) = Rec <$> (mapM (\(b, e) -> (b,) <$> transformExpr' st e) bs)
@@ -165,41 +247,24 @@ transformExpr :: State -> CoreExpr -> CoreM (CoreExpr, Info)
 
 transformExpr st e@(App e1 e2)
   | matchesRun st e1 = do
-        {- case convert st e2 of
-            Nothing -> do
-                putMsgS "fail"
-                return (e, [])
-            Just a -> do
-                --names <- names' st a-}
         putMsgS "success"
         var2 <- mkSysLocalM (fsLit "hashan2") (getType'' st)
-        --run <- createRun st (map Var names)
-        return (Var var2, [RunExpr var2 e2 (exprFreeVars e2)])
+        putMsgS $ showSDocUnsafe (ppr (getPrincipalVars st e2))
+        putMsgS $ showSDocUnsafe (ppr (getFreeVars st e2))
+        return (e, [])
+        --return (Var var2, [RunExpr var2 e2 (exprFreeVars e2)])
   | otherwise = do
         (e1', info1) <- transformExpr st e1
         (e2', info2) <- transformExpr st e2
         let e' = App e1' e2'
-        {-when ((not (null info1)) && (not (null info2))) do
-          putMsgS "join"-}
-        {-if ((not (null info1)) && (not (null info2)))
-          then do
-            ee <- make st (info1 ++ info2) e'
-            return (ee, [])
-          else return (e', info1 ++ info2)-}
         return (e', info1 ++ info2)
 
 transformExpr st e@(Lam x e1) = do
   (e1', info) <- transformExpr st e1
-  --let info' = filter (notPresent x) info
-  {-if (length info /= length info')
-    then do -}
   e1'' <- force st info e1'
   return $ (Lam x e1'', [])
-    {-else
-      return (Lam x e', info')-}
 
 transformExpr st e@(Let (NonRec x e1) e2) = do
-  --(e1', info1) <- transformExpr st e1
   putMsgS "let"
   (e1', info1) <- transformExpr st e1
   (e2', info2) <- transformExpr st e2
@@ -231,27 +296,6 @@ transformAlts st as = do
   putMsgS "case"
   as' <- mapM (\(a, b, c) -> ((a,b,) <$> transformExpr' st c)) as
   return $ (as', [])
-
-{-transformExpr :: State -> CoreExpr -> CoreM CoreExpr
--- See 'Id'/'Var' in 'compiler/basicTypes/Var.lhs' (note: it's opaque)
-transformExpr st e@(Var x) | isTyVar x    = return e
-                        | isTcTyVar x  = return e
-                        | isLocalId x  = return e
-                        | isGlobalId x = return e
--- See 'Literal' in 'compiler/basicTypes/Literal.lhs'
-transformExpr st e@(Lit l)     = return e
-transformExpr st e@(App e1 e2) = do when (matchesRun st e1) (convert st e2)
-                                    return e
-transformExpr st e@(Lam x e1)   = return e
--- b is a Bind CoreBndr, which is the same as CoreBind
-transformExpr st e@(Let b e1)   = return e
--- Remember case in core is strict!
-transformExpr st e@(Case e1 b t as) = return e
--- XXX These are pretty esoteric...
-transformExpr _ e@(Cast e1 c)  = return e
-transformExpr _ e@(Tick t e1)  = return e
-transformExpr _ e@(Type t)    = return e
-transformExpr _ e@(Coercion c) = return e-}
 
 install :: [CommandLineOption] -> [CoreToDo] -> CoreM [CoreToDo]
 install _ todo = do

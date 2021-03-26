@@ -1,4 +1,4 @@
---{-# OPTIONS_GHC -fplugin=Plugin #-}
+{-# OPTIONS_GHC -fplugin=Plugin #-}
 {-# LANGUAGE TypeApplications, FlexibleInstances, BangPatterns, DataKinds, GADTs, TemplateHaskell, BlockArguments #-}
 module Main where
 
@@ -110,7 +110,7 @@ get (m, n) = do
   biases <- makeR' n 0.1
   return (weights, biases)
 
-type Two = S (S Z)
+type Two = S (S Z) 
 
 doBatch :: Vec Two (Tensor, Tensor) -> Tensor -> Tensor -> [[Float]] -> Int -> IO (Vec Two (Tensor, Tensor))
 doBatch weights _ _ [] _ = return weights
