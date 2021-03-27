@@ -1,4 +1,4 @@
-{-# LANGUAGE ForeignFunctionInterface, LambdaCase, TypeFamilies, UndecidableInstances, AllowAmbiguousTypes, TypeFamilyDependencies, DeriveFunctor, ScopedTypeVariables, GADTs, StandaloneDeriving, StandaloneKindSignatures, DataKinds, BangPatterns, TypeApplications, DeriveLift, FlexibleInstances, TemplateHaskell, BlockArguments #-}
+{-# LANGUAGE ForeignFunctionInterface, LambdaCase, PolyKinds, TypeFamilies, UndecidableInstances, AllowAmbiguousTypes, RankNTypes, TypeFamilyDependencies, DeriveFunctor, ScopedTypeVariables, GADTs, StandaloneDeriving, StandaloneKindSignatures, DataKinds, BangPatterns, TypeApplications, DeriveLift, FlexibleInstances, TemplateHaskell, BlockArguments #-}
 module Lib where
 
 -- AllowAmbiguousTypes
@@ -20,6 +20,7 @@ import Data.List (intercalate)
 import Control.Monad.State.Lazy
 import Control.Monad (when)
 import Data.Kind (Type)
+import Debug.Trace (trace)
 
 -- #include "tensorflow/compiler/xla/hashan/c_api.h"
 
@@ -62,12 +63,12 @@ data BinOp
   | ReduceAdd
   | Gather
   | Compare CompOp
-  deriving (Eq, Lift)
+  deriving (Eq, Lift, Show)
 
 data TreeSize 
   = Real Int
   | Fake Int
-  deriving (Eq, Lift)
+  deriving (Eq, Lift, Show)
 
 data UnaryOp
   = Sine
@@ -82,7 +83,7 @@ data UnaryOp
   | ReduceArgMax
   | Reshape SizeExtra
   | Broadcast SizeExtra
-  deriving (Eq, Lift)
+  deriving (Eq, Lift, Show)
 
 data CompOp
   = LT
@@ -97,10 +98,10 @@ data TreePrim a
   = Constant Float
   | Identity Int
   -- | Parameter a
-  | BinEval BinOp a a
-  | UnaryEval UnaryOp a
+  | BinEval BinOp !a !a
+  | UnaryEval UnaryOp !a
   | CrossRef Int
-  deriving (Functor, Lift)
+  deriving (Functor, Lift, Show)
 
 data Free f a
   = Pure a
@@ -108,7 +109,14 @@ data Free f a
   deriving (Functor)
 
 type Tree a = Free TreePrim a
--- deriving instance Lift (Tree )
+
+deriving instance Show (TreeRaw)
+deriving instance Show (Tree Buffer)
+
+instance Show Buffer where
+  show _ = "Buffer"
+  --show (Device _ _) = "BufferDevice"
+  --show (Const _) = "BufferConst"
 
 instance Num Buffer where
   a + b = run (binEval Add (Pure a) (Pure b))
@@ -154,16 +162,18 @@ getSize (Device a b) = b
 
 change :: Tree Buffer -> State Int (TreeRaw, [Buffer])
 change (Pure (Const f)) = return (Impure (Constant f), [])
-change (Pure a@(Device _ size)) = do
-  st <- get
-  put (st + 1)
-  return (Pure (st, size), [a])
+change (Pure a) = do
+  trace "pure" $ case a of 
+    Device _ size -> do
+      st <- get
+      put (st + 1)
+      return (Pure (st, size), [a])
 change (Impure (BinEval binOp treeA treeB)) = do
-  (treeA', result) <- change treeA
-  (treeB', result') <- change treeB
+  (treeA', result) <- trace ("binOp1 " ++ show treeA) (change treeA)
+  (treeB', result') <- trace "binOp2 " (change treeB)
   return (binEval binOp treeA' treeB', result ++ result')
 change (Impure (UnaryEval unOp tree)) = do 
-  (tree', result) <- change tree
+  (tree', result) <- trace ("unOp " ++ show unOp) $ change tree
   return (unaryEval unOp tree', result)
 change (Impure (Constant f)) = do
   return (Impure (Constant f), [])
@@ -173,14 +183,16 @@ change (Impure (Identity n)) = do
 runHelper :: [Tree Buffer] -> State Int ([TreeRaw], [Buffer])
 runHelper [] = return ([], [])
 runHelper (x:xs) = do
-  (tree, params) <- change x
-  (tree', params') <- runHelper xs
+  (tree, params) <- trace ("c") (change x)
+  (tree', params') <- trace ("s: " ++ (show tree)) runHelper xs
   return (tree:tree', params ++ params')
 
 runInner :: [Tree Buffer] -> [Buffer]
 runInner trees = unsafePerformIO do
+  print "here"
   let ((tree', xs), _) = runState (runHelper trees) 0
   let (code, size) = evalTop tree'
+  print $ "here2 " ++ show tree'
   --putStrLn "running hlo"
   code' <- newCString code
   arr <- newArray (map (\(Device x _) -> unsafeForeignPtrToPtr x) xs)
@@ -264,8 +276,7 @@ cols (Device _ size) = cols' size
 cols' (Dim2 _ n) = n
 cols' (Dim2R _ n) = n
 
-shouldNotBeReachable :: a
-shouldNotBeReachable = error "should not be reachable"
+--shouldNotBeReachable = error "should not be reachable"
 
 showSize :: Size -> String
 showSize = showSize' "f32"

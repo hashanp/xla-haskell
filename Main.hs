@@ -122,7 +122,7 @@ doBatch weights x y (b:bs) n = do
   let y' = gather (reshape y (Dim2 60000 1)) (reshape z (Dim2 size 1))
   let y'' = gather (identity 10) (reshape y' (Dim2 size 1))
   let (!p, !loss) = $$(compute layers) weights y'' x'
-  printView loss
+  printView loss 
   when (n `mod` 50 == 0) do
     performMajorGC
   doBatch (zipWith' (update stepSize) weights (reverse' p)) x y bs (n + 1)

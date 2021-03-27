@@ -9,11 +9,12 @@ import IfaceEnv (lookupOrigIO)
 import OccName hiding (varName, mkTcOcc) -- (mkVarOcc, mkDataOcc)
 import Data.Generics hiding (TyCon)
 import Control.Monad (when, (<=<))
-import TysWiredIn (consDataCon, consDataConName, nilDataConName, nilDataCon, intTy)
+import TysWiredIn (consDataCon, consDataConName, nilDataConName, nilDataCon, intDataCon)
+import TysPrim (intPrimTy)
 import PrelNames (metaConsDataConName)
 import Name hiding (varName)
 import TyCon (mkPrelTyConRepName, TyCon)
-import Literal (LitNumType(..), Literal(..))
+import Literal (LitNumType(..), Literal(..), nullAddrLit)
 import CoreFVs (exprFreeVars)
 import VarSet (VarSet, elemVarSet, emptyVarSet, unionVarSets, unitVarSet, mkVarSet, disjointVarSet)
 import Debug.Trace (trace)
@@ -23,7 +24,7 @@ import FastString (fsLit)
 import CoreUtils (exprType)
 import CoreMonad (SimplMode)
 import BasicTypes (CompilerPhase(..))
-import Data.List (findIndex)
+import Data.List (findIndex, isPrefixOf)
 
 plugin :: Plugin
 plugin = defaultPlugin 
@@ -49,6 +50,7 @@ data State = State
   , getCrossRef :: DataCon
   , getReal :: DataCon
   , getFake :: DataCon
+  , getFree :: TyCon
   }
 
 matcherT :: (State -> TyCon) -> (State -> CoreExpr -> Bool)
@@ -83,15 +85,23 @@ matchFirst v (RunExpr v1 _ _ _) = v == v1
 
 resolveLen info v = (length info -) <$> findIndex (matchFirst v) info
 
+num i = App (Var (dataConWorkId intDataCon)) (Lit (LitNumber LitNumInt (toInteger i) intPrimTy))
+
 substVars :: Info -> State -> CoreExpr -> CoreExpr
 substVars info st e@(App a (Var b)) 
   | isBase st a = case resolveLen info b of
                     Nothing -> e
-                    Just i -> App (Var (dataConWorkId (getCrossRef st))) (Lit (LitNumber LitNumInt (toInteger i) intTy))
+                    Just i -> App impureApped (App (App crossRef (Type freeTy)) (num i))
+  where bufferTy = mkTyConApp (getBuffer st) []
+        treePrimTy = mkTyConApp (getTreePrim st) []
+        freeTy = mkTyConApp (getFree st) [treePrimTy, bufferTy]
+        crossRef = Var (dataConWorkId (getCrossRef st))
+        impure = Var (dataConWorkId (getImpure st))
+        impureApped = App (App impure (Type treePrimTy)) (Type bufferTy)
 substVars info st e@(App (Var e1) (App (Var e2) (Var e3)))
   | isBase2 st e1 e2 = case resolveLen info e3 of 
                          Nothing -> e
-                         Just i -> App (Var (dataConWorkId (getFake st))) (Lit (LitNumber LitNumInt (toInteger i) intTy))
+                         Just i -> App (Var (dataConWorkId (getFake st))) (num i)
 substVars info st (App a b)
   | isSafe st a = App (substVars info st a) (substVars info st b)
 substVars _ _ e = e
@@ -118,15 +128,18 @@ transformProgram :: ModGuts -> CoreM ModGuts
 transformProgram guts = do
   hscEnv <- getHscEnv
   mod' <- liftIO $ findImportedModule hscEnv (mkModuleName "Lib") Nothing
+  otherMod' <- liftIO $ findImportedModule hscEnv (mkModuleName "Control.Exception.Base") Nothing
   --mod'' <- liftIO $ findImportedModule hscEnv (mkModuleName "GHC.Types") Nothing
   let (Found _ mod) = mod'
+  let (Found _ otherMod) = otherMod'
   let getName = liftIO . lookupOrigIO hscEnv mod . mkVarOcc
   let getTyCon = lookupTyCon <=< (liftIO . lookupOrigIO hscEnv mod . mkTcOcc)
   let getDataCon = lookupDataCon <=< (liftIO . lookupOrigIO hscEnv mod . mkDataOcc)
 
   realRun <- getName "run"
   runInner <- getName "runInner"
-  shouldNotBeReachable <- getName "shouldNotBeReachable"
+  -- shouldNotBeReachable <- getName "shouldNotBeReachable"
+  shouldNotBeReachable <- liftIO (lookupOrigIO hscEnv otherMod  (mkVarOcc "patError"))
 
   impure <- getDataCon "Impure"
   pur <- getDataCon "Pure"
@@ -139,6 +152,7 @@ transformProgram guts = do
   treePrim <- getTyCon "TreePrim"
   size <- getTyCon "SizePrim"
   unary <- getTyCon "UnaryOp"
+  free <- getTyCon "Free"
 
   id <- lookupId shouldNotBeReachable
   runId <- lookupId runInner
@@ -164,6 +178,7 @@ transformProgram guts = do
                 , getCrossRef = crossRef
                 , getReal = real
                 , getFake = fake
+                , getFree = free
                 }
 
   --putMsgS (showSDocUnsafe $ ppr name)
@@ -173,8 +188,8 @@ transformProgram guts = do
 transformFunc :: State -> ModGuts -> CoreBind -> CoreM CoreBind
 transformFunc st guts x = do
   putMsgS "---"
-  putMsgS $ showSDocUnsafe $ interpp'SP $ getNames x
-  b <- shouldTransformBind guts x
+  let b = "doBatch" `isPrefixOf` (getOccString $ head (getNames x))
+  -- b <- shouldTransformBind guts x
   if b
     then transformBind st x -- everywhereM (mkM (transformExpr st)) x -- mkM/everywhereM are from 'syb'
     else return x
@@ -213,7 +228,7 @@ convert st e = Nothing
 data RunExpr = RunExpr Var CoreExpr VarSet VarSet
 type Info = [RunExpr]
 
-present xs (RunExpr _ _ varSet _) = any (`elemVarSet` varSet) xs
+present xs (RunExpr _ _ varSet1 varSet2) = any (`elemVarSet` varSet1) xs || any (`elemVarSet` varSet2) xs
 
 getType :: State -> CoreExpr
 getType st = Type $ mkTyConApp (getTree st) [mkTyConApp (getBuffer st) []]
@@ -249,9 +264,10 @@ createDown st ty (var2:ns) e e' = do
   var1 <- mkSysLocalM (fsLit "hashan1") (getType' st)
   var3 <- mkSysLocalM (fsLit "hashan3") (getType' st)
   rest <- createDown st ty ns (Var var3) e'
+  let t = tyConAppArgs (typeKind ty) !! 0
   return $ Case e var1 ty 
-    [(DataAlt consDataCon, [var2, var3], rest),
-     (DataAlt nilDataCon, [], Var (getError st))]
+    [(DataAlt nilDataCon, [], App (App (App (Var (getError st)) (Type t)) (Type ty)) (Lit nullAddrLit)),
+     (DataAlt consDataCon, [var2, var3], rest)]
 
 make :: State -> Info -> CoreExpr -> CoreM CoreExpr
 make st info e = do
@@ -263,7 +279,7 @@ make st info e = do
 compat :: Info -> Info -> Bool
 compat info1 info2 = provided `disjointVarSet` needed
   where provided = mkVarSet $ map (\(RunExpr a _ _ _) -> a) info1
-        needed = unionVarSets $ map (\(RunExpr _ _ c _) -> c) info2
+        needed = unionVarSets $ concatMap (\(RunExpr _ _ c d) -> [c{-,d-}]) info2
 
 resolve :: Var -> CoreExpr -> (CoreExpr -> CoreExpr)
 resolve v (Var v2) = substExpr (text "hashan") subst
@@ -298,11 +314,11 @@ transformExpr st e@(App e1 e2)
         putMsgS $ showSDocUnsafe (ppr (getFreeVars st e2))
         --return (e, [])
         return (Var var2, [RunExpr var2 e2 (getFreeVars st e2) (getPrincipalVars st e2)])
-  | otherwise = do
+  {-| otherwise = do
         (e1', info1) <- transformExpr st e1
         (e2', info2) <- transformExpr st e2
         let e' = App e1' e2'
-        return (e', info1 ++ info2)
+        return (e', info1 ++ info2)-}
 
 transformExpr st e@(Lam x e1) = do
   (e1', info) <- transformExpr st e1
@@ -313,29 +329,31 @@ transformExpr st e@(Let (NonRec x e1) e2) = do
   putMsgS "let"
   (e1', info1) <- transformExpr st e1
   (e2', info2) <- transformExpr st (resolve x e1' e2)
-  if not (null (filter (present [x]) info2)) || not (info1 `compat` info2)
+  let info2' = map (\(RunExpr a b c d) -> RunExpr a (substVars info1 st b) c d) info2
+  if not (null (filter (present [x]) info2')) || not (info1 `compat` info2')
     then do
-      e2'' <- force st info2 e2'
+      e2'' <- force st info2' e2'
       return (Let (NonRec x e1') e2'', info1)
     else
       return (Let (NonRec x e1') e2', info1 ++ map (\(RunExpr a b c d) -> RunExpr a (substVars info1 st b) c d) info2)
   
 transformExpr st (Case e1 b t as) = do
-  (e1', info1) <- transformExpr st e1
+  --(e1', info1) <- transformExpr st e1
+  let (e1', info1) = (e1, [])
   (as', info2) <- transformAlts st as
   return (Case e1' b t as', info1 ++ info2)
 
 transformExpr st e = return (e, [])
 
-transformAlts st [(f, h, g)] = do
-  putMsgS "caseOne"
+{- transformAlts st [(f, h, g)] = do
+  putMsgS "caseOne" 
   (g', info) <- transformExpr st g
   if not (null (filter (present h) info))
     then do
       g'' <- force st info g'
       return ([(f, h, g'')], [])
     else
-      return ([(f, h, g')], info)
+      return ([(f, h, g')], info) -}
 
 transformAlts st as = do
   putMsgS "case"

@@ -36,5 +36,5 @@ executable haskell
   -- include-dirs: ../tensorflow/bazel-bin/tensorflow/include/
   include-dirs: ../tensorflow/
   extra-libraries: xla
-  ghc-options: -ddump-simpl
+  ghc-options: -ddump-simpl -dcore-lint
   build-tools: c2hs
