@@ -334,27 +334,46 @@ transformExpr st e@(Lam x e1) = do
   return $ (Lam x e1'', [])
 
 transformExpr st e@(Let (NonRec x e1) e2) = do
-  putMsgS "let"
+  putMsgS $ "let " ++ showSDocUnsafe (ppr x)
   (e1', info1) <- transformExpr st e1
   (e2', info2) <- transformExpr st (resolve x e1' e2)
-  let info2' = map (\(RunExpr a b c d) -> RunExpr a (substVars info1 st b) c d) info2
-  if not (null (filter (present [x]) info2')) || not (info1 `compat` info2')
+  --let info2' = map (\(RunExpr a b c d) -> RunExpr a (substVars info1 st b) c d) info2
+  if not (null (filter (present [x]) info2)) || not (info1 `compat` info2)
     then do
-      e2'' <- force st info2' e2'
+      e2'' <- force st info2 e2'
       return (Let (NonRec x e1') e2'', info1)
     else
-      return (Let (NonRec x e1') e2', info1 ++ map (\(RunExpr a b c d) -> RunExpr a (substVars info1 st b) c d) info2)
-  
-transformExpr st (Case e1 b t as) = do
+      let p = exprFreeVars e2' in
+      let info' = foldl (\acc (RunExpr a b c d) -> acc ++ [RunExpr a (substVars acc st b) c d]) info1 info2 in
+      if x `elemVarSet` p
+        then return (Let (NonRec x e1') e2', info') 
+        else return (e2', info')
+
+transformExpr st (Case e1 x t [(f, g, e2)]) = do
+  putMsgS "caseOne" 
   (e1', info1) <- transformExpr st e1
-  --let (e1', info1) = (e1, [])
-  (as', info2) <- transformAlts st as
-  return (Case e1' b t as', info1 ++ info2)
+  (e2', info2) <- transformExpr st (resolve x e1' e2)
+  if not (null (filter (present (x:g)) info2)) || not (info1 `compat` info2)
+    then do
+      e2'' <- force st info2 e2'
+      return (Case e1' x t [(f, g, e2'')], info1)
+    else
+      let p = exprFreeVars e2' in
+      let info' = foldl (\acc (RunExpr a b c d) -> acc ++ [RunExpr a (substVars acc st b) c d]) info1 info2 in
+      if any (`elemVarSet` p) (x:g)
+        then return (Case e1' x t [(f, g, e2')], info')
+        else return (e2', info')
+
+transformExpr st (Case e1 b t as) = do
+  putMsgS "case"
+  (e1', info1) <- transformExpr st e1
+  as' <- mapM (\(a, b, c) -> ((a,b,) <$> transformExpr' st c)) as
+  return (Case e1' b t as', info1)
 
 transformExpr st e = return (e, [])
 
-{-transformAlts st [(f, h, g)] = do
-  putMsgS "caseOne" 
+--let (e1', info1) = (e1, [])
+{-transformAlts st = do
   (g', info) <- transformExpr st g
   if not (null (filter (present h) info))
     then do
@@ -362,11 +381,6 @@ transformExpr st e = return (e, [])
       return ([(f, h, g'')], [])
     else
       return ([(f, h, g')], info)-}
-
-transformAlts st as = do
-  putMsgS "case"
-  as' <- mapM (\(a, b, c) -> ((a,b,) <$> transformExpr' st c)) as
-  return $ (as', [])
 
 install :: [CommandLineOption] -> [CoreToDo] -> CoreM [CoreToDo]
 install _ todo = do
@@ -382,4 +396,4 @@ install _ todo = do
                     , sm_case_case  = True
                     }
   let pass = CoreDoPluginPass "Template" transformProgram
-  return $ todo ++ [pass, CoreDoSimplify 3 simplPass]
+  return $ todo ++ [pass {- CoreDoSimplify 3 simplPass -}]

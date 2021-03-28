@@ -416,7 +416,7 @@ eval t (Impure (BinEval (Compare op) treeA treeB)) = do
   put (st + 1)
   complete outputSize "convert" (result ++ result' ++ [compare]) ["compare." ++ show st] []
 
-eval t (Impure (BinEval Dot treeA treeB)) = do
+eval t m@(Impure (BinEval Dot treeA treeB)) = do
   (result, loc, size) <- eval t treeA
   (result', loc', size') <- eval t treeB
   let outputSize = findSize' t (BinEval Dot size size')

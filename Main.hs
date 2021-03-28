@@ -90,6 +90,7 @@ makeR' m scale = do
   values <- normalsIO
   return (create1D (map (* scale) (take m values)))
 
+{-# INLINE update #-}
 update :: Float -> (Tensor, Tensor) -> (Tensor, Tensor) -> (Tensor, Tensor)
 update stepSize (w, b) (deltaW, deltaB) = (w - broadcast' (rows w, cols w) (c' stepSize) * deltaW, b - broadcast (len b) (c' stepSize) * deltaB)
 
