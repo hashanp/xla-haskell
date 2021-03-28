@@ -49,7 +49,8 @@ data State = State
   , getUnary :: TyCon
   , getCrossRef :: DataCon
   , getReal :: DataCon
-  , getFake :: DataCon
+  , getFakeRows :: DataCon
+  , getFakeCols :: DataCon
   , getFree :: TyCon
   }
 
@@ -87,6 +88,11 @@ resolveLen info v = (length info -) <$> findIndex (matchFirst v) info
 
 num i = App (Var (dataConWorkId intDataCon)) (Lit (LitNumber LitNumInt (toInteger i) intPrimTy))
 
+getAppropriate :: State -> Var -> Var
+getAppropriate st v
+  | v == getCols st = dataConWorkId $ getFakeCols st
+  | v == getRows st = dataConWorkId $ getFakeRows st
+
 substVars :: Info -> State -> CoreExpr -> CoreExpr
 substVars info st e@(App a (Var b)) 
   | isBase st a = case resolveLen info b of
@@ -101,7 +107,7 @@ substVars info st e@(App a (Var b))
 substVars info st e@(App (Var e1) (App (Var e2) (Var e3)))
   | isBase2 st e1 e2 = case resolveLen info e3 of 
                          Nothing -> e
-                         Just i -> App (Var (dataConWorkId (getFake st))) (num i)
+                         Just i -> App (Var (getAppropriate st e2)) (num i)
 substVars info st (App a b)
   | isSafe st a = App (substVars info st a) (substVars info st b)
 substVars _ _ e = e
@@ -145,7 +151,8 @@ transformProgram guts = do
   pur <- getDataCon "Pure"
   crossRef <- getDataCon "CrossRef"
   real <- getDataCon "Real"
-  fake <- getDataCon "Fake"
+  fakeRows <- getDataCon "FakeRows"
+  fakeCols <- getDataCon "FakeCols"
 
   tree <- getTyCon "Tree"
   buffer <- getTyCon "Buffer"
@@ -177,7 +184,8 @@ transformProgram guts = do
                 , getUnary = unary
                 , getCrossRef = crossRef
                 , getReal = real
-                , getFake = fake
+                , getFakeRows = fakeRows
+                , getFakeCols = fakeCols
                 , getFree = free
                 }
 
@@ -314,11 +322,11 @@ transformExpr st e@(App e1 e2)
         putMsgS $ showSDocUnsafe (ppr (getFreeVars st e2))
         --return (e, [])
         return (Var var2, [RunExpr var2 e2 (getFreeVars st e2) (getPrincipalVars st e2)])
-  {-| otherwise = do
+  | otherwise = do
         (e1', info1) <- transformExpr st e1
         (e2', info2) <- transformExpr st e2
         let e' = App e1' e2'
-        return (e', info1 ++ info2)-}
+        return (e', info1 ++ info2)
 
 transformExpr st e@(Lam x e1) = do
   (e1', info) <- transformExpr st e1
@@ -338,14 +346,14 @@ transformExpr st e@(Let (NonRec x e1) e2) = do
       return (Let (NonRec x e1') e2', info1 ++ map (\(RunExpr a b c d) -> RunExpr a (substVars info1 st b) c d) info2)
   
 transformExpr st (Case e1 b t as) = do
-  --(e1', info1) <- transformExpr st e1
-  let (e1', info1) = (e1, [])
+  (e1', info1) <- transformExpr st e1
+  --let (e1', info1) = (e1, [])
   (as', info2) <- transformAlts st as
   return (Case e1' b t as', info1 ++ info2)
 
 transformExpr st e = return (e, [])
 
-{- transformAlts st [(f, h, g)] = do
+{-transformAlts st [(f, h, g)] = do
   putMsgS "caseOne" 
   (g', info) <- transformExpr st g
   if not (null (filter (present h) info))
@@ -353,7 +361,7 @@ transformExpr st e = return (e, [])
       g'' <- force st info g'
       return ([(f, h, g'')], [])
     else
-      return ([(f, h, g')], info) -}
+      return ([(f, h, g')], info)-}
 
 transformAlts st as = do
   putMsgS "case"

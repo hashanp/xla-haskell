@@ -1,4 +1,4 @@
-{-# LANGUAGE ForeignFunctionInterface, LambdaCase, PolyKinds, TypeFamilies, UndecidableInstances, AllowAmbiguousTypes, RankNTypes, TypeFamilyDependencies, DeriveFunctor, ScopedTypeVariables, GADTs, StandaloneDeriving, StandaloneKindSignatures, DataKinds, BangPatterns, TypeApplications, DeriveLift, FlexibleInstances, TemplateHaskell, BlockArguments #-}
+{-# LANGUAGE ForeignFunctionInterface, LambdaCase, TypeFamilies, UndecidableInstances, AllowAmbiguousTypes, TypeFamilyDependencies, DeriveFunctor, ScopedTypeVariables, GADTs, StandaloneDeriving, StandaloneKindSignatures, DataKinds, BangPatterns, TypeApplications, DeriveLift, FlexibleInstances, TemplateHaskell, BlockArguments #-}
 module Lib where
 
 -- AllowAmbiguousTypes
@@ -46,10 +46,15 @@ type TreeRaw = Tree (Int, Size)
 type Tensor = Buffer
 type Layer = (Code ((Tensor, Tensor, Tensor) -> Tensor), Code ((Tensor, Tensor, Tensor) -> Tensor -> Tensor -> (Tensor, Tensor, Tensor)))
 
+thd (a, b, c) = c
+
 makeIntoTreeSize :: Size -> SizeExtra
 makeIntoTreeSize = fmap Real
-extractFromTreeSize :: SizeExtra -> Size
-extractFromTreeSize = fmap (\case {Fake a -> a ; Real a -> a})
+extractFromTreeSize :: [Result] -> SizeExtra -> Size
+extractFromTreeSize res = fmap (\case 
+                              Real a -> a
+                              FakeRows a -> rows' (thd (res !! (length res - a)))
+                              FakeCols a -> cols' (thd (res !! (length res - a))))
 
 data BinOp
   = Add
@@ -67,7 +72,8 @@ data BinOp
 
 data TreeSize 
   = Real Int
-  | Fake Int
+  | FakeRows Int
+  | FakeCols Int
   deriving (Eq, Lift, Show)
 
 data UnaryOp
@@ -162,37 +168,35 @@ getSize (Device a b) = b
 
 change :: Tree Buffer -> State Int (TreeRaw, [Buffer])
 change (Pure (Const f)) = return (Impure (Constant f), [])
-change (Pure a) = do
-  trace "pure" $ case a of 
-    Device _ size -> do
-      st <- get
-      put (st + 1)
-      return (Pure (st, size), [a])
+change (Pure a@(Device _ size)) = do
+  st <- get
+  put (st + 1)
+  return (Pure (st, size), [a])
 change (Impure (BinEval binOp treeA treeB)) = do
-  (treeA', result) <- trace ("binOp1 " ++ show treeA) (change treeA)
-  (treeB', result') <- trace "binOp2 " (change treeB)
+  (treeA', result) <- change treeA
+  (treeB', result') <- change treeB
   return (binEval binOp treeA' treeB', result ++ result')
 change (Impure (UnaryEval unOp tree)) = do 
-  (tree', result) <- trace ("unOp " ++ show unOp) $ change tree
+  (tree', result) <- change tree
   return (unaryEval unOp tree', result)
 change (Impure (Constant f)) = do
   return (Impure (Constant f), [])
 change (Impure (Identity n)) = do
   return (Impure (Identity n), [])
+change (Impure (CrossRef n)) = do
+  return (Impure (CrossRef n), [])
 
 runHelper :: [Tree Buffer] -> State Int ([TreeRaw], [Buffer])
 runHelper [] = return ([], [])
 runHelper (x:xs) = do
-  (tree, params) <- trace ("c") (change x)
-  (tree', params') <- trace ("s: " ++ (show tree)) runHelper xs
+  (tree, params) <- change x
+  (tree', params') <- runHelper xs
   return (tree:tree', params ++ params')
 
 runInner :: [Tree Buffer] -> [Buffer]
 runInner trees = unsafePerformIO do
-  print "here"
   let ((tree', xs), _) = runState (runHelper trees) 0
   let (code, size) = evalTop tree'
-  print $ "here2 " ++ show tree'
   --putStrLn "running hlo"
   code' <- newCString code
   arr <- newArray (map (\(Device x _) -> unsafeForeignPtrToPtr x) xs)
@@ -203,6 +207,13 @@ runInner trees = unsafePerformIO do
   return $ zipWith Device t'' size
 
 run a = head $ runInner [a]
+
+evalAll :: [Result] -> [TreeRaw] -> State Int [Result]
+evalAll res [] = return res
+evalAll res (x:xs) = do
+  x' <- eval res x
+  let res' = res ++ [x']
+  evalAll res' xs
 
 evalTop :: [TreeRaw] -> (String, [Size])
 evalTop trees = (unlines $ [
@@ -229,7 +240,7 @@ evalTop trees = (unlines $ [
   concat results ++
   ["  ROOT tuple." ++ (show st) ++ " = (" ++ sizes' ++ ") tuple(" ++ locs' ++ ")",
   "}"], sizes)
-  where (triples, st) = (runState (mapM eval trees) 1) :: ([([String], String, Size)], Int)
+  where (triples, st) = (runState (evalAll [] trees) 1) :: ([([String], String, Size)], Int)
         sizes = map (\(a,b,c) -> c) triples
         results = map (\(a,b,c) -> a) triples
         locs = map (\(a,b,c) -> b) triples
@@ -309,53 +320,59 @@ compat' _ _ = False
 
 compat m n = compat' (norm m) (norm n)
 
-findSize :: Tree Buffer -> Size
+{-findSize :: Tree Buffer -> Size
 findSize (Pure a) = getSize a
-findSize (Impure a) = findSize' $ fmap findSize a
+findSize (Impure a) = findSize' $ fmap findSize a-}
 
-findSize' :: TreePrim Size -> Size
-findSize' (Constant _) = Dim0
-findSize' (Identity n) = Dim2 n n
-findSize' (UnaryEval (Broadcast s) _) = extractFromTreeSize s
-findSize' (UnaryEval (Reshape s) _) = extractFromTreeSize s
-findSize' (UnaryEval Transpose size) = 
+findSize' :: [Result] -> TreePrim Size -> Size
+findSize' _ (Constant _) = Dim0
+findSize' _ (Identity n) = Dim2 n n
+findSize' t (UnaryEval (Broadcast s) _) = extractFromTreeSize t s
+findSize' t (UnaryEval (Reshape s) _) = extractFromTreeSize t s
+findSize' _ (UnaryEval Transpose size) = 
   case size of
     Dim2 a b -> Dim2R b a
     Dim2R a b -> Dim2 b a
     _ -> error "Size Mismatch"
-findSize' (UnaryEval ReduceArgMax size) = 
+findSize' _ (UnaryEval ReduceArgMax size) = 
   case norm size of 
     Dim2 rows cols -> Dim1 rows
     _ -> error "Size Mismatch"
-findSize' (UnaryEval op a) = a
-findSize' (BinEval Gather a b) =
+findSize' _ (UnaryEval op a) = a
+findSize' _ (BinEval Gather a b) =
   case (a, b) of
     (Dim2 m 1, Dim2 _ n) -> Dim2 m n
     _ -> error "Size Mismatch"
-findSize' (BinEval Dot a b) = a `compat` b
+findSize' _ (BinEval Dot a b) = a `compat` b
   where compat m n = compat' (norm m) (norm n)
         compat' (Dim2 m1 m2) (Dim2 n1 n2)
           | m2 == n1 = Dim2 m1 n2
         compat' (Dim1 m) (Dim1 n)
           | m == n = Dim0
         compat' m n = error $ "Size Mismatch, " ++ show m ++ ", " ++ show n
-findSize' (BinEval ReduceAdd a b)
+findSize' _ (BinEval ReduceAdd a b)
   | b == Dim0 = case norm a of
                   Dim1 m -> Dim0
                   Dim2 m n -> Dim1 m
                   _ -> error "Size Mismatch"
   | otherwise = error "Size Mismatch"
-findSize' (BinEval op a b)
+findSize' _ (BinEval op a b)
   | a `compat` b = a
   | otherwise = error "Size Mismatch"
 
-eval :: TreeRaw -> State Int ([String], String, Size)
-eval (Pure (i, size)) = 
+type Result = ([String], String, Size)
+
+eval :: [Result] -> TreeRaw -> State Int Result
+eval a (Impure (CrossRef n)) = do
+  let (_, c, d) = a !! (length a - n)
+  return ([], c, d)
+
+eval _ (Pure (i, size)) = 
   complete size "parameter" [] [show i] []
 
-eval (Impure (UnaryEval (Broadcast size'') tree)) = do
-  (result, loc, size') <- eval tree
-  let size = extractFromTreeSize size''
+eval t (Impure (UnaryEval (Broadcast size'') tree)) = do
+  (result, loc, size') <- eval t tree
+  let size = extractFromTreeSize t size''
   let args = compat size' size
   complete size "broadcast" result [loc] args
   where compat Dim0 (Dim2R _ _) = error "Size Mismatch"
@@ -366,13 +383,13 @@ eval (Impure (UnaryEval (Broadcast size'') tree)) = do
           | m == n1 = [("dimensions", "{0}")]
         compat m n = error $ "Size Mismatch " ++ show m ++ ", " ++ show n
 
-eval (Impure (UnaryEval Transpose tree)) = do
-  (result, loc, size) <- eval tree
-  let outputSize = findSize' (UnaryEval Transpose size) 
+eval t (Impure (UnaryEval Transpose tree)) = do
+  (result, loc, size) <- eval t tree
+  let outputSize = findSize' t (UnaryEval Transpose size) 
   complete outputSize "transpose" result [loc] [("dimensions", "{1,0}")]
 
-eval (Impure (UnaryEval ReduceArgMax tree)) = do
-  (result, loc, size) <- eval tree
+eval t (Impure (UnaryEval ReduceArgMax tree)) = do
+  (result, loc, size) <- eval t tree
   let Dim2 rows cols = norm size
   st <- get
   let op1 = "  constant." ++ show st ++ " = f32[] constant(-inf)"
@@ -384,34 +401,34 @@ eval (Impure (UnaryEval ReduceArgMax tree)) = do
   put (st + 4)
   complete (Dim1 rows) "get-tuple-element" (result ++ [op1, op2, op3, op4]) ["reduce." ++ show (st + 3)] [("index", "1")]
 
-eval (Impure (UnaryEval op tree)) = do
-  (result, loc, size) <- eval tree
+eval t (Impure (UnaryEval op tree)) = do
+  (result, loc, size) <- eval t tree
   let opStr = unary op
-  let outputSize = findSize' (UnaryEval op size)
+  let outputSize = findSize' t (UnaryEval op size)
   complete outputSize opStr result [loc] []
 
-eval (Impure (BinEval (Compare op) treeA treeB)) = do
-  (result, loc, size) <- eval treeA
-  (result', loc', size') <- eval treeB
-  let outputSize = findSize' (BinEval (Compare op) size size')
+eval t (Impure (BinEval (Compare op) treeA treeB)) = do
+  (result, loc, size) <- eval t treeA
+  (result', loc', size') <- eval t treeB
+  let outputSize = findSize' t (BinEval (Compare op) size size')
   st <- get
   let compare = "  compare." ++ show st ++ " = " ++ showSize' "pred" outputSize ++ " compare(" ++ loc ++ ", " ++ loc' ++ "), direction=" ++ show op 
   put (st + 1)
   complete outputSize "convert" (result ++ result' ++ [compare]) ["compare." ++ show st] []
 
-eval (Impure (BinEval Dot treeA treeB)) = do
-  (result, loc, size) <- eval treeA
-  (result', loc', size') <- eval treeB
-  let outputSize = findSize' (BinEval Dot size size')
+eval t (Impure (BinEval Dot treeA treeB)) = do
+  (result, loc, size) <- eval t treeA
+  (result', loc', size') <- eval t treeB
+  let outputSize = findSize' t (BinEval Dot size size')
   let args = case outputSize of
                Dim0 -> [("lhs_contracting_dims", "{0}"), ("rhs_contracting_dims", "{0}")]
                Dim2 _ _ -> [("lhs_contracting_dims", "{1}"), ("rhs_contracting_dims", "{0}")]
   complete outputSize "dot" (result ++ result') [loc, loc'] args
 
-eval (Impure (BinEval Gather treeA treeB)) = do
-  (result, loc, size) <- eval treeA
-  (result', loc', size') <- eval treeB
-  let outputSize@(Dim2 rows cols) = findSize' (BinEval Gather size' size)
+eval t (Impure (BinEval Gather treeA treeB)) = do
+  (result, loc, size) <- eval t treeA
+  (result', loc', size') <- eval t treeB
+  let outputSize@(Dim2 rows cols) = findSize' t (BinEval Gather size' size)
   st <- get
   let convert = "  convert." ++ show st ++ " = s32[" ++ show rows ++ ",1]{1,0} convert(" ++ loc' ++ ")" 
   put (st + 1)
@@ -419,27 +436,27 @@ eval (Impure (BinEval Gather treeA treeB)) = do
     [("offset_dims", "{1}"), ("collapsed_slice_dims", "{0}"), ("start_index_map","{0}"),
       ("index_vector_dim", "1"), ("slice_sizes", "{1," ++ show cols ++ "}")]
 
-eval (Impure (BinEval ReduceAdd treeA treeB)) = do
-  (result, loc, size) <- eval treeA
-  (result', loc', size') <- eval treeB
-  let outputSize = findSize' (BinEval ReduceAdd size size')
+eval t (Impure (BinEval ReduceAdd treeA treeB)) = do
+  (result, loc, size) <- eval t treeA
+  (result', loc', size') <- eval t treeB
+  let outputSize = findSize' t (BinEval ReduceAdd size size')
   let dims = case outputSize of
                Dim1 _ -> "{1}"
                Dim0 -> "{0}"
   complete outputSize "reduce" (result ++ result') [loc, loc'] [("dimensions", dims), ("to_apply", "primitive_computation_add.0")]
 
-eval (Impure (BinEval op treeA treeB)) = do
-  (result, loc, size) <- eval treeA
-  (result', loc', size') <- eval treeB
-  let outputSize = findSize' (BinEval op size size')
+eval t (Impure (BinEval op treeA treeB)) = do
+  (result, loc, size) <- eval t treeA
+  (result', loc', size') <- eval t treeB
+  let outputSize = findSize' t (BinEval op size size')
   let opStr = fromJust $ lookup op binary
   complete outputSize opStr (result ++ result') [loc, loc'] []
 
-eval (Impure (Constant f)) = do
-  let outputSize = findSize' (Constant f)
+eval t (Impure (Constant f)) = do
+  let outputSize = findSize' t (Constant f)
   complete outputSize "constant" [] [show f] []
 
-eval (Impure (Identity n)) = do
+eval _ (Impure (Identity n)) = do
   st <- get 
   let size = show n ++ "," ++ show n
   let op1 = "  iota." ++ show st ++ " = s32[" ++ size ++ "] iota(), iota_dimension=0"
@@ -503,12 +520,13 @@ unaryEval a b = Impure $ UnaryEval a b
       binEval x (Pure (run y)) z = binEval x y z ; #-}
 {-# RULES "hashan/unaryEval" forall x y.
       unaryEval x (Pure (run y)) = unaryEval x y ; #-}
-{-# RULES "hashan/rows" forall x.
+
+{- {-# RULES "hashan/rows" forall x.
       rows (run x) = rows' (findSize x) ; #-}
 {-# RULES "hashan/cols" forall x.
       cols (run x) = cols' (findSize x) ; #-}
 {-# RULES "hashan/len" forall x.
-      len (run x) = len' (findSize x) ; #-}
+      len (run x) = len' (findSize x) ; #-} -}
 
 {-- {-# RULES "hashan/binEvalRight" forall x y z.
       run (BinEval x y (Parameter (run z))) = run (BinEval x y z) ; #-}
