@@ -60,7 +60,14 @@ data State = State
   , getFakeCols :: DataCon
   , getFree :: TyCon
   , getSimplEnv :: SimplEnv
+  , getIndent :: Int
   }
+
+putIndent :: State -> String -> CoreM ()
+putIndent st s = putMsgS $ (take (getIndent st) (repeat ' ')) ++ "- " ++ s
+
+incr :: State -> State
+incr st = st { getIndent = (getIndent st + 2) }
 
 runSimpl :: State -> Int -> SimplM a -> CoreM a
 runSimpl st i comp = do
@@ -205,6 +212,7 @@ transformProgram env guts = do
                 , getFakeCols = fakeCols
                 , getFree = free
                 , getSimplEnv = env
+                , getIndent = 0
                 }
 
   --putMsgS (showSDocUnsafe $ ppr name)
@@ -334,10 +342,10 @@ transformExpr :: State -> CoreExpr -> CoreM (CoreExpr, Info)
 
 transformExpr st e@(App e1 e2)
   | matchesRun st e1 = do
-        putMsgS "success"
+        --putMsgS "success"
         var2 <- mkSysLocalM (fsLit "hashan2") (getType'' st)
-        putMsgS $ showSDocUnsafe (ppr (getPrincipalVars st e2))
-        putMsgS $ showSDocUnsafe (ppr (getFreeVars st e2))
+        --putMsgS $ showSDocUnsafe (ppr (getPrincipalVars st e2))
+        --putMsgS $ showSDocUnsafe (ppr (getFreeVars st e2))
         --return (e, [])
         return (Var var2, [RunExpr var2 e2 (getFreeVars st e2) (getPrincipalVars st e2)])
   | otherwise = do
@@ -352,18 +360,19 @@ transformExpr st e@(Lam x e1) = do
   return $ (Lam x e1'', [])
 
 transformExpr st e@(Let (NonRec x e1) e2) = do
-  (e1', info1) <- transformExpr st e1
+  putIndent st $ "lethead " ++ showSDocUnsafe (ppr x)
+  (e1', info1) <- transformExpr (incr st) e1
   if null info1 
     then do
-      putMsgS $ "leta " ++ showSDocUnsafe (ppr x)
-      (e2', info2) <- transformExpr st e2
+      putIndent st $ "letbase " ++ showSDocUnsafe (ppr x)
+      (e2', info2) <- transformExpr (incr st) e2
       e2'' <- force st info2 e2'
       return (Let (NonRec x e1') e2'', [])
     else do
-      putMsgS $ "letb " ++ showSDocUnsafe (ppr x)
+      putIndent st $ "letrec " ++ showSDocUnsafe (ppr x)
       let expToSimplify = Let (NonRec x e1') e2
       e' <- occurAnalyseExpr <$> (runSimpl st (exprSize expToSimplify) $ simplExpr (getSimplEnv st) expToSimplify)
-      (e'', info2) <- transformExpr st e'
+      (e'', info2) <- transformExpr (incr st) e'
       if info1 `compat` info2
         then do
           let info' = foldl (\acc (RunExpr a b c d) -> acc ++ [RunExpr a (substVars acc st b) c d]) info1 info2
@@ -386,9 +395,9 @@ transformExpr st e@(Let (NonRec x e1) e2) = do
         else return (e2', info')-}
 
 transformExpr st (Case e1 x t [(f, g, e2)]) = do
-  putMsgS "caseOne" 
-  (e1', info1) <- transformExpr st e1
-  (e2', info2) <- transformExpr st (resolve x e1' e2)
+  putIndent st $ "caseOne " ++ showSDocUnsafe (ppr x)
+  (e1', info1) <- transformExpr (incr st) e1
+  (e2', info2) <- transformExpr (incr st) (resolve x e1' e2)
   if not (null (filter (present (x:g)) info2)) || not (info1 `compat` info2)
     then do
       e2'' <- force st info2 e2'
@@ -401,12 +410,22 @@ transformExpr st (Case e1 x t [(f, g, e2)]) = do
         else return (e2', info')
 
 transformExpr st (Case e1 b t as) = do
-  putMsgS "case"
-  (e1', info1) <- transformExpr st e1
-  as' <- mapM (\(a, b, c) -> ((a,b,) <$> transformExpr' st c)) as
+  putIndent st $ "case " ++ showSDocUnsafe (ppr b)
+  (e1', info1) <- transformExpr (incr st) e1
+  as' <- mapM (\(a, b, c) -> ((a,b,) <$> transformExpr' (incr st) c)) as
   return (Case e1' b t as', info1)
 
-transformExpr st e = return (e, [])
+transformExpr st e@(Type ty) = return (e, [])
+
+transformExpr st e@(Coercion co) = return (e, [])
+
+transformExpr st (Cast e co) = do
+  (e', info) <- transformExpr (incr st) e
+  return (Cast e' co, info)
+
+transformExpr st e = do
+  putIndent st $ "bailout"
+  return (e, [])
 
 --let (e1', info1) = (e1, [])
 {-transformAlts st = do

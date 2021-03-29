@@ -509,6 +509,7 @@ unaryEval a b = Impure $ UnaryEval a b
 {-# INLINE eq #-}
 {-# INLINE softmax #-}
 {-# INLINE mean #-}
+{-# INLINE mean' #-}
 {-# INLINE identity #-}
 {-# INLINE transpose #-}
 {-# INLINE reduceArgMax #-}
@@ -543,6 +544,7 @@ mul :: [TExpQ Buffer] -> TExpQ (Buffer -> Buffer)
 mul [] = [|| \a -> a ||]
 mul (x:xs) = [|| \a -> $$x * $$(mul xs) a ||]
 
+{-# NOINLINE printView #-}
 printView (Device a _) = xlaPrint (unsafeForeignPtrToPtr a)
 initialise = xlaInit 
 
@@ -554,8 +556,8 @@ compute layers
   = [|| \weights targets input -> 
       let activations = $$(forwardPass layers) weights input in
       let preds = softmax (last' activations) in
-      let !loss = negate (mean (sum (log preds * targets))) in
-      let delta = (preds - targets) / (broadcast' (rows input, 10) (c (rows input))) in
+      let !loss = negate (mean' (sum (log preds * targets))) in
+      let delta = (preds - targets) / (broadcast' (rows input, 10) 128) in
       let !backward = $$(backwardPass (reverse' layers)) (reverse' weights) (reverse' activations) delta in
       (backward, loss)
     ||]
@@ -621,6 +623,7 @@ linear = (
 
 sum x = run (binEval ReduceAdd (Pure x) (Pure 0))
 mean x = sum x / c (len x)
+mean' x = sum x / 128
 softmax x = exp x / (broadcast' (rows x, cols x) (sum (exp x)))
 
 data Nat = Z | S Nat

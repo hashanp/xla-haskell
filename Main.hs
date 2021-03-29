@@ -65,7 +65,9 @@ oneHotEncode x = map (\y -> if x == y then 1 else 0) [0..9]
 
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
-chunksOf n xs = xs1 : chunksOf n xs2 
+chunksOf n xs
+  | length xs1 == 128 = xs1 : chunksOf n xs2
+  | otherwise = []
   where (xs1, xs2) = splitAt n xs
 
 shuffle xs = do
