@@ -25,6 +25,13 @@ import CoreUtils (exprType)
 import CoreMonad (SimplMode)
 import BasicTypes (CompilerPhase(..))
 import Data.List (findIndex, isPrefixOf)
+import Simplify (simplExpr)
+import SimplEnv (mkSimplEnv, SimplEnv, seDynFlags)
+import SimplMonad (initSmpl, SimplM)
+import FamInstEnv (emptyFamInstEnv)
+import CoreSyn (emptyRuleEnv)
+import CoreStats (exprSize)
+import OccurAnal (occurAnalyseExpr)
 
 plugin :: Plugin
 plugin = defaultPlugin 
@@ -52,7 +59,17 @@ data State = State
   , getFakeRows :: DataCon
   , getFakeCols :: DataCon
   , getFree :: TyCon
+  , getSimplEnv :: SimplEnv
   }
+
+runSimpl :: State -> Int -> SimplM a -> CoreM a
+runSimpl st i comp = do
+  let dynFlags = seDynFlags $ getSimplEnv st
+  let ruleEnv = emptyRuleEnv
+  let fam = (emptyFamInstEnv, emptyFamInstEnv)
+  uniqSupply <- getUniqueSupplyM
+  (a, _) <- liftIO $ initSmpl dynFlags ruleEnv fam uniqSupply i comp
+  return a
 
 matcherT :: (State -> TyCon) -> (State -> CoreExpr -> Bool)
 matcherT f st (Type t)
@@ -130,8 +147,8 @@ getFreeVars st (App a b)
   | isSafe st a = unionVarSets [getFreeVars st a, getFreeVars st b]
 getFreeVars _ e = exprFreeVars e
 
-transformProgram :: ModGuts -> CoreM ModGuts
-transformProgram guts = do
+transformProgram :: SimplEnv -> ModGuts -> CoreM ModGuts
+transformProgram env guts = do
   hscEnv <- getHscEnv
   mod' <- liftIO $ findImportedModule hscEnv (mkModuleName "Lib") Nothing
   otherMod' <- liftIO $ findImportedModule hscEnv (mkModuleName "Control.Exception.Base") Nothing
@@ -187,6 +204,7 @@ transformProgram guts = do
                 , getFakeRows = fakeRows
                 , getFakeCols = fakeCols
                 , getFree = free
+                , getSimplEnv = env
                 }
 
   --putMsgS (showSDocUnsafe $ ppr name)
@@ -334,9 +352,27 @@ transformExpr st e@(Lam x e1) = do
   return $ (Lam x e1'', [])
 
 transformExpr st e@(Let (NonRec x e1) e2) = do
-  putMsgS $ "let " ++ showSDocUnsafe (ppr x)
   (e1', info1) <- transformExpr st e1
-  (e2', info2) <- transformExpr st (resolve x e1' e2)
+  if null info1 
+    then do
+      putMsgS $ "leta " ++ showSDocUnsafe (ppr x)
+      (e2', info2) <- transformExpr st e2
+      e2'' <- force st info2 e2'
+      return (Let (NonRec x e1') e2'', [])
+    else do
+      putMsgS $ "letb " ++ showSDocUnsafe (ppr x)
+      let expToSimplify = Let (NonRec x e1') e2
+      e' <- occurAnalyseExpr <$> (runSimpl st (exprSize expToSimplify) $ simplExpr (getSimplEnv st) expToSimplify)
+      (e'', info2) <- transformExpr st e'
+      if info1 `compat` info2
+        then do
+          let info' = foldl (\acc (RunExpr a b c d) -> acc ++ [RunExpr a (substVars acc st b) c d]) info1 info2
+          return (e'', info')
+        else do
+          e''' <- force st info2 e''
+          return (e''', info1)
+
+  {-(e2', info2) <- transformExpr st (resolve x e1' e2)
   --let info2' = map (\(RunExpr a b c d) -> RunExpr a (substVars info1 st b) c d) info2
   if not (null (filter (present [x]) info2)) || not (info1 `compat` info2)
     then do
@@ -347,7 +383,7 @@ transformExpr st e@(Let (NonRec x e1) e2) = do
       let info' = foldl (\acc (RunExpr a b c d) -> acc ++ [RunExpr a (substVars acc st b) c d]) info1 info2 in
       if x `elemVarSet` p
         then return (Let (NonRec x e1') e2', info') 
-        else return (e2', info')
+        else return (e2', info')-}
 
 transformExpr st (Case e1 x t [(f, g, e2)]) = do
   putMsgS "caseOne" 
@@ -386,7 +422,7 @@ install :: [CommandLineOption] -> [CoreToDo] -> CoreM [CoreToDo]
 install _ todo = do
   putMsgS "Hello!"
   dflags <- getDynFlags
-  let simplPass = SimplMode 
+  {-let simplPass = SimplMode 
                     { sm_phase      = Phase 0
                     , sm_names      = []
                     , sm_dflags     = dflags
@@ -394,6 +430,16 @@ install _ todo = do
                     , sm_eta_expand = True
                     , sm_inline     = True
                     , sm_case_case  = True
+                    }-}
+  let simplPass = SimplMode 
+                    { sm_phase      = Phase 0
+                    , sm_names      = []
+                    , sm_dflags     = dflags
+                    , sm_rules      = True
+                    , sm_eta_expand = False
+                    , sm_inline     = True
+                    , sm_case_case  = False
                     }
-  let pass = CoreDoPluginPass "Template" transformProgram
+  let simplEnv = mkSimplEnv simplPass
+  let pass = CoreDoPluginPass "Template" $ transformProgram simplEnv
   return $ todo ++ [pass {- CoreDoSimplify 3 simplPass -}]
