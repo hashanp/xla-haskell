@@ -1,8 +1,6 @@
 {-# LANGUAGE ForeignFunctionInterface, LambdaCase, TypeFamilies, UndecidableInstances, AllowAmbiguousTypes, TypeFamilyDependencies, DeriveFunctor, ScopedTypeVariables, GADTs, StandaloneDeriving, StandaloneKindSignatures, DataKinds, BangPatterns, TypeApplications, DeriveLift, FlexibleInstances, TemplateHaskell, BlockArguments #-}
 module Lib where
 
---AllowAmbiguousTypes
-
 import Language.Haskell.TH.Lib
 import Language.Haskell.TH.Syntax hiding (Type)
 import Prelude hiding (sum)
@@ -21,11 +19,6 @@ import Control.Monad.State.Lazy
 import Control.Monad (when)
 import Data.Kind (Type)
 import Debug.Trace (trace)
-
--- #include "tensorflow/compiler/xla/hashan/c_api.h"
-
---finalizer XLA_Remove as ^
---{#pointer *Buffer as BufferPrim foreign finalizer XLA_Remove as ^ newtype#}
 
 data BufferPrim
 foreign import ccall "XLA_CreateBuffer1D" xlaCreateBuffer :: Ptr CFloat -> CInt -> IO (Ptr BufferPrim)
@@ -521,20 +514,6 @@ unaryEval a b = Impure $ UnaryEval a b
       binEval x (Pure (run y)) z = binEval x y z ; #-}
 {-# RULES "hashan/unaryEval" forall x y.
       unaryEval x (Pure (run y)) = unaryEval x y ; #-}
-
-{- {-# RULES "hashan/rows" forall x.
-      rows (run x) = rows' (findSize x) ; #-}
-{-# RULES "hashan/cols" forall x.
-      cols (run x) = cols' (findSize x) ; #-}
-{-# RULES "hashan/len" forall x.
-      len (run x) = len' (findSize x) ; #-} -}
-
-{-- {-# RULES "hashan/binEvalRight" forall x y z.
-      run (BinEval x y (Parameter (run z))) = run (BinEval x y z) ; #-}
-{-# RULES "hashan/binEvalLeft" forall x y z.
-      run (BinEval x (Parameter (run y)) z) = run (BinEval x y z) ; #-}
-{-# RULES "hashan/unaryEval" forall x y.
-      run (UnaryEval x (Parameter (run y))) = run (UnaryEval x y) ; #-} --}
 
 power ::  (Num a) => Int -> TExpQ (a -> a)
 power 0 = [|| const 1 ||]

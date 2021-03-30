@@ -118,17 +118,30 @@ type Two = S (S Z)
 doBatch :: Vec Two (Tensor, Tensor) -> Tensor -> Tensor -> [[Float]] -> Int -> IO (Vec Two (Tensor, Tensor))
 doBatch weights _ _ [] _ = return weights
 doBatch weights x y (b:bs) n = do
-  print $ "iteration " ++ show n
+  --print $ "iteration " ++ show n
   let z = make' b
   let size = len z
   let x' = gather x (reshape z (Dim2 size 1))
   let y' = gather (reshape y (Dim2 60000 1)) (reshape z (Dim2 size 1))
   let y'' = gather (identity 10) (reshape y' (Dim2 size 1))
   let (!p, !loss) = $$(compute layers) weights y'' x'
-  printView loss 
-  {-when (n `mod` 50 == 0) do
-    performMajorGC-}
+  when (n `mod` 20 == 0) do
+    printView loss
   doBatch (zipWith' (update stepSize) weights (reverse' p)) x y bs (n + 1)
+
+doIteration :: Int -> Vec Two (Tensor, Tensor) -> Tensor -> Tensor -> IO (Vec Two (Tensor, Tensor))
+doIteration 0 weights _ _ = return weights
+doIteration n weights x y = do
+  putStrLn $ show n ++ " iterations left"
+  batch <- chunksOf batchSize <$> shuffle [0..59999]
+  weights' <- doBatch weights x y batch 0
+  let res = $$(forwardPass layers) weights' x
+  let res' = eq y (reduceArgMax (softmax (last' res)))
+  let res'' = mean res'
+  putStrLn "Accuracy:"
+  printView res''
+  performMajorGC
+  doIteration (n - 1) weights' x y
 
 main = do
   initialise
@@ -140,7 +153,8 @@ main = do
   initial <- mapM' get ( (784, 1024) `cons`
                         ((1024, 1024) `cons`
                         nil (1024, 10)))
-  batch <- chunksOf batchSize <$> shuffle [0..59999]
+  doIteration 10 initial x y
+
   {-let p = $$(forwardPass layers) initial x'
   print $ head batch
   print $ (length p)
@@ -150,15 +164,10 @@ main = do
   let p'' = $$(backwardPass (reverse layers)) (reverse initial) (reverse p) delta
   --let res = reduceArgMax preds
   --let res2 = eq (reshape res (Dim2 128 1)) y'-}
-  p <- doBatch initial x y batch 0
-  let res = $$(forwardPass layers) p x
-  let res' = eq y (reduceArgMax (softmax (last' res)))
-  let res'' = mean res'
   --printView (gather (fst $ p !! 1) (reshape other (Dim2 10 1)))
   --printView (snd $ last p'')
   --print $ (take 50 batch)
-  print $ length' p
-  printView res'' --(mean (reshape res2 (Dim1 128)))
+   --(mean (reshape res2 (Dim1 128)))
 
 {-print $ idxDimensions images
   let a = make [[1,2],[3,4],[5,6]]
