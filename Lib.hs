@@ -1,7 +1,7 @@
 {-# LANGUAGE ForeignFunctionInterface, LambdaCase, TypeFamilies, UndecidableInstances, AllowAmbiguousTypes, TypeFamilyDependencies, DeriveFunctor, ScopedTypeVariables, GADTs, StandaloneDeriving, StandaloneKindSignatures, DataKinds, BangPatterns, TypeApplications, DeriveLift, FlexibleInstances, TemplateHaskell, BlockArguments #-}
 module Lib where
 
--- AllowAmbiguousTypes
+--AllowAmbiguousTypes
 
 import Language.Haskell.TH.Lib
 import Language.Haskell.TH.Syntax hiding (Type)
@@ -193,20 +193,20 @@ runHelper (x:xs) = do
   (tree', params') <- runHelper xs
   return (tree:tree', params ++ params')
 
-runInner :: [Tree Buffer] -> [Buffer]
-runInner trees = unsafePerformIO do
+runInner :: [Tree Buffer] -> [Bool] -> [Buffer]
+runInner trees present = unsafePerformIO do
   let ((tree', xs), _) = runState (runHelper trees) 0
-  let (code, size) = evalTop tree'
+  let (code, size) = evalTop tree' present
   --putStrLn "running hlo"
   code' <- newCString code
   arr <- newArray (map (\(Device x _) -> unsafeForeignPtrToPtr x) xs)
   -- putStrLn $ "len " ++ show (length xs)
   t <- xlaCreate code' (fromIntegral (length xs)) arr
-  t' <- peekArray (length trees) t
+  t' <- peekArray (length size) t
   t'' <- mapM (newForeignPtr (xlaRemove (fromIntegral 0))) t'
   return $ zipWith Device t'' size
 
-run a = head $ runInner [a]
+run a = head $ runInner [a] [True]
 
 evalAll :: [Result] -> [TreeRaw] -> State Int [Result]
 evalAll res [] = return res
@@ -215,8 +215,8 @@ evalAll res (x:xs) = do
   let res' = res ++ [x']
   evalAll res' xs
 
-evalTop :: [TreeRaw] -> (String, [Size])
-evalTop trees = (unlines $ [
+evalTop :: [TreeRaw] -> [Bool] -> (String, [Size])
+evalTop trees present = (unlines $ [
   "HloModule xla_comp.0", 
   "",
   "primitive_computation_add.0 {",
@@ -241,9 +241,9 @@ evalTop trees = (unlines $ [
   ["  ROOT tuple." ++ (show st) ++ " = (" ++ sizes' ++ ") tuple(" ++ locs' ++ ")",
   "}"], sizes)
   where (triples, st) = (runState (evalAll [] trees) 1) :: ([([String], String, Size)], Int)
-        sizes = map (\(a,b,c) -> c) triples
+        sizes = map snd (filter fst (zip present (map (\(a,b,c) -> c) triples)))
         results = map (\(a,b,c) -> a) triples
-        locs = map (\(a,b,c) -> b) triples
+        locs = map snd (filter fst (zip present (map (\(a,b,c) -> b) triples)))
         sizes' = intercalate ", " (map showSize sizes)
         locs' = intercalate ", " locs
 
@@ -666,33 +666,3 @@ instance VecHelpers n => VecHelpers (S n) where
   reverse' (x, y) = snoc' (reverse' y) x
   length' (x, y) = 1 + length' y
   last' (x, y) = last' y
-
-{-type Vec :: Nat -> Type -> Type
-data Vec t n where
-  Nil :: Vec Z t
-  (:-) :: !t -> !(Vec n t) -> Vec (S n) t-}
-
-{-mapM' :: (Monad m) => (t1 -> m t2) -> Vec n t1 -> m (Vec n t2)
-mapM' f Nil = return Nil
-mapM' f (a :- b) = liftM2 (:-) (f a) (mapM' f b)
-
-zipWith' :: (t1 -> t2 -> t3) -> Vec n t1 -> Vec n t2 -> Vec n t3
-zipWith' f Nil Nil = Nil
-zipWith' f (a1 :- b1) (a2 :- b2) = f a1 a2 :- zipWith' f b1 b2
-
-snoc' :: Vec n t -> t -> Vec (S n) t
-snoc' Nil x = x :- Nil
-snoc' (x :- y) z = x :- snoc' y z
-
-reverse' :: Vec n t -> Vec n t
-reverse' Nil = Nil
-reverse' (x :- y) = snoc' (reverse' y) x
-
-last' :: Vec n t -> t
-last' (x :- Nil) = x
-last' (x :- y) = last' y
-
-length' :: Vec n t -> Int
-length' Nil = 0
-length' (x :- y) = 1 + length' y-}
-

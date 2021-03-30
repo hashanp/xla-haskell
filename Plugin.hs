@@ -9,7 +9,7 @@ import IfaceEnv (lookupOrigIO)
 import OccName hiding (varName, mkTcOcc) -- (mkVarOcc, mkDataOcc)
 import Data.Generics hiding (TyCon)
 import Control.Monad (when, (<=<))
-import TysWiredIn (consDataCon, consDataConName, nilDataConName, nilDataCon, intDataCon)
+import TysWiredIn (consDataCon, consDataConName, nilDataConName, nilDataCon, intDataCon, trueDataCon, falseDataCon, boolTy)
 import TysPrim (intPrimTy)
 import PrelNames (metaConsDataConName)
 import Name hiding (varName)
@@ -64,7 +64,7 @@ data State = State
   }
 
 putIndent :: State -> String -> CoreM ()
-putIndent st s = putMsgS $ (take (getIndent st) (repeat ' ')) ++ "- " ++ s
+putIndent st s = putMsgS $ (take (getIndent st) (repeat ' ')) ++ s
 
 incr :: State -> State
 incr st = st { getIndent = (getIndent st + 2) }
@@ -264,8 +264,8 @@ type Info = [RunExpr]
 
 present xs (RunExpr _ _ varSet1 varSet2) = any (`elemVarSet` varSet1) xs || any (`elemVarSet` varSet2) xs
 
-getType :: State -> CoreExpr
-getType st = Type $ mkTyConApp (getTree st) [mkTyConApp (getBuffer st) []]
+getType :: State -> Type
+getType st = mkTyConApp (getTree st) [mkTyConApp (getBuffer st) []]
 
 getType' :: State -> Type
 getType' st = mkTyConApp listTyCon [mkTyConApp (getBuffer st) []]
@@ -273,12 +273,12 @@ getType' st = mkTyConApp listTyCon [mkTyConApp (getBuffer st) []]
 getType'' :: State -> Type
 getType'' st = mkTyConApp (getBuffer st) []
 
-createRun :: State -> [CoreExpr] -> CoreM CoreExpr
-createRun st [] = do
-  return $ App (Var (dataConWorkId nilDataCon)) (getType st)
-createRun st (x:xs) = do
-  rest <- createRun st xs
-  return $ App (App (App (Var (dataConWorkId consDataCon)) (getType st)) x) rest
+createRun :: State -> Type -> [CoreExpr] -> CoreM CoreExpr
+createRun st ty [] = do
+  return $ App (Var (dataConWorkId nilDataCon)) (Type ty)
+createRun st ty (x:xs) = do
+  rest <- createRun st ty xs
+  return $ App (App (App (Var (dataConWorkId consDataCon)) (Type ty)) x) rest
 
 names' :: State -> [CoreExpr] -> CoreM [Var]
 names' _ [] = return []
@@ -305,10 +305,16 @@ createDown st ty (var2:ns) e e' = do
 
 make :: State -> Info -> CoreExpr -> CoreM CoreExpr
 make st info e = do
+  let freeVars = exprFreeVars e
   let (ns, ls) = getAll info
-  run <- createRun st ls
-  let expr = App (Var (getRunId st)) run
-  createDown st (exprType e) ns expr e
+  let present = map (\a -> if a `elemVarSet` freeVars 
+                  then Var (dataConWorkId trueDataCon) 
+                  else Var (dataConWorkId falseDataCon)) ns
+  run1 <- createRun st (getType st) ls
+  run2 <- createRun st boolTy present
+  let ns' = filter (`elemVarSet` freeVars) ns
+  let expr = App (App (Var (getRunId st)) run1) run2
+  createDown st (exprType e) ns' expr e
 
 compat :: Info -> Info -> Bool
 compat info1 info2 = provided `disjointVarSet` needed
@@ -355,30 +361,39 @@ transformExpr st e@(App e1 e2)
         return (e', info1 ++ info2)
 
 transformExpr st e@(Lam x e1) = do
-  (e1', info) <- transformExpr st e1
-  e1'' <- force st info e1'
-  return $ (Lam x e1'', [])
+  putIndent st $ "lam " ++ showSDocUnsafe (ppr x) ++ " {"
+  (e1', info) <- transformExpr (incr st) e1
+  putIndent st $ "}"
+  if not (null (filter (present [x]) info))
+    then do
+      e1'' <- force st info e1'
+      return $ (Lam x e1'', [])
+    else
+      return $ (Lam x e1', info)
 
 transformExpr st e@(Let (NonRec x e1) e2) = do
-  putIndent st $ "lethead " ++ showSDocUnsafe (ppr x)
+  putIndent st $ "lethead " ++ showSDocUnsafe (ppr x) ++ " {"
   (e1', info1) <- transformExpr (incr st) e1
   if null info1 
     then do
-      putIndent st $ "letbase " ++ showSDocUnsafe (ppr x)
+      putIndent st $ "} letbase {" -- ++ showSDocUnsafe (ppr x)
       (e2', info2) <- transformExpr (incr st) e2
       e2'' <- force st info2 e2'
+      putIndent st $ "}"
       return (Let (NonRec x e1') e2'', [])
     else do
-      putIndent st $ "letrec " ++ showSDocUnsafe (ppr x)
+      putIndent st $ "} letrec {" -- ++ showSDocUnsafe (ppr x) ++ " " ++ (show (length info1))
       let expToSimplify = Let (NonRec x e1') e2
       e' <- occurAnalyseExpr <$> (runSimpl st (exprSize expToSimplify) $ simplExpr (getSimplEnv st) expToSimplify)
       (e'', info2) <- transformExpr (incr st) e'
       if info1 `compat` info2
         then do
           let info' = foldl (\acc (RunExpr a b c d) -> acc ++ [RunExpr a (substVars acc st b) c d]) info1 info2
+          putIndent st $ "} " ++ (show (length info'))
           return (e'', info')
         else do
           e''' <- force st info2 e''
+          putIndent st $ "} " ++ (show (length info1))
           return (e''', info1)
 
   {-(e2', info2) <- transformExpr st (resolve x e1' e2)
@@ -395,9 +410,10 @@ transformExpr st e@(Let (NonRec x e1) e2) = do
         else return (e2', info')-}
 
 transformExpr st (Case e1 x t [(f, g, e2)]) = do
-  putIndent st $ "caseOne " ++ showSDocUnsafe (ppr x)
+  putIndent st $ "caseOne " ++ showSDocUnsafe (ppr x) ++ " {"
   (e1', info1) <- transformExpr (incr st) e1
   (e2', info2) <- transformExpr (incr st) (resolve x e1' e2)
+  putIndent st "}"
   if not (null (filter (present (x:g)) info2)) || not (info1 `compat` info2)
     then do
       e2'' <- force st info2 e2'
@@ -410,9 +426,10 @@ transformExpr st (Case e1 x t [(f, g, e2)]) = do
         else return (e2', info')
 
 transformExpr st (Case e1 b t as) = do
-  putIndent st $ "case " ++ showSDocUnsafe (ppr b)
+  putIndent st $ "case " ++ showSDocUnsafe (ppr b) ++ " {"
   (e1', info1) <- transformExpr (incr st) e1
   as' <- mapM (\(a, b, c) -> ((a,b,) <$> transformExpr' (incr st) c)) as
+  putIndent st "}"
   return (Case e1' b t as', info1)
 
 transformExpr st e@(Type ty) = return (e, [])
@@ -422,6 +439,10 @@ transformExpr st e@(Coercion co) = return (e, [])
 transformExpr st (Cast e co) = do
   (e', info) <- transformExpr (incr st) e
   return (Cast e' co, info)
+
+transformExpr st e@(Var id) = do
+  putIndent st $ "var " ++ (showSDocUnsafe (ppr id))
+  return (e, [])
 
 transformExpr st e = do
   putIndent st $ "bailout"

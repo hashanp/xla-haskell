@@ -126,8 +126,8 @@ doBatch weights x y (b:bs) n = do
   let y'' = gather (identity 10) (reshape y' (Dim2 size 1))
   let (!p, !loss) = $$(compute layers) weights y'' x'
   printView loss 
-  when (n `mod` 50 == 0) do
-    performMajorGC
+  {-when (n `mod` 50 == 0) do
+    performMajorGC-}
   doBatch (zipWith' (update stepSize) weights (reverse' p)) x y bs (n + 1)
 
 main = do
@@ -150,7 +150,7 @@ main = do
   let p'' = $$(backwardPass (reverse layers)) (reverse initial) (reverse p) delta
   --let res = reduceArgMax preds
   --let res2 = eq (reshape res (Dim2 128 1)) y'-}
-  p <- doBatch initial x y (take 200 batch) 0
+  p <- doBatch initial x y batch 0
   let res = $$(forwardPass layers) p x
   let res' = eq y (reduceArgMax (softmax (last' res)))
   let res'' = mean res'
